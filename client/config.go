@@ -1,0 +1,21 @@
+package client
+
+import (
+	"time"
+
+	"github.com/sionreview/sion/proxy/config"
+)
+
+var (
+	// MaxLambdaStores This setting will avoid network contention. Must equal or smaller than config.NumLambdaClusters
+	MaxLambdaStores int = config.SliceSize
+
+	// Timeout The timeout of a single operation
+	Timeout = 10 * time.Second
+
+	// Timeout The timeout for sending header fields, and reading response headers.
+	HeaderTimeout = 3 * time.Second
+
+	// Timeout The timeout for sending header fields, and reading response headers.
+	PreflightTimeout = 20 * time.Millisecond
+)

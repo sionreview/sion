@@ -1,0 +1,15 @@
+#!/bin/bash
+
+PWD=`dirname $0`
+DATA="~/go/src/github.com/sionreview/sion/evaluation/data"
+DOWNLOAD=$PWD/downloaded/proxy/
+REMOTE="my server"
+
+if [ "$1" == "" ] ; then
+	echo "Please specify the data directory, in the form of YYYYMMDDHHmm"
+	exit 1
+fi
+
+mkdir -p $DOWNLOAD
+ssh -t ubuntu@$REMOTE "cd $DATA && tar -czf $1.tar.gz $1 $1*.log logs/$1"
+scp ubuntu@$REMOTE:$DATA/$1.tar.gz $DOWNLOAD
