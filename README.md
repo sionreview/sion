@@ -1,6 +1,6 @@
-# Sion
+# SION: Elastic Serverless Cloud Storage
 
-**Sion** is an elastic, high-performance, cost-effective cloud storage that is built atop ephemeral cloud funtions.
+**SION** is an elastic, high-performance, cost-effective cloud storage that is built atop ephemeral cloud functions.
 
 ## Prepare
 
