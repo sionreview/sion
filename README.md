@@ -151,3 +151,7 @@
   Run `make start-local` to start a stand-alone local proxy server, which will invoke functions locally to simulation Lambda execution.
 
   Run `make test` to put/get a toy object.
+
+## Related repo
+
+Workload replayer [sionreplayer](https://github.com/sionreview/sionreplayer)
