@@ -40,7 +40,7 @@ var (
 
 type reqCtxKey string
 
-// Client InfiniCache client
+// Client SION client
 type Client struct {
 	EC           reedsolomon.Encoder
 	Ring         *consistent.Consistent

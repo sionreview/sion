@@ -1,6 +1,7 @@
 deploy:
 	aws configure
-	
+	aws s3api put-bucket-policy --bucket sionreview.datapool --policy file://${GOPATH}/src/github.com/sionreview/sion/evaluation/cloudwatch/policy.json
+
 prepare:
 	mkdir -p bin/
 
@@ -53,7 +54,7 @@ start-local: build-local
 	bin/proxy -cluster=static -functions=10 -invoker=local -disable-recovery -ip=127.0.0.1 $(PARAMS)
 
 stop-server:
-	kill -2 $(shell cat /tmp/infinicache.pid)
+	kill -2 $(shell cat /tmp/sion.pid)
 
 benchmark: build-bench
 	bin/sionreplayer -n 10 -c 1 -keymin 1 -keymax 10 -sz 1048576 -d 10 -p 2 -op 0

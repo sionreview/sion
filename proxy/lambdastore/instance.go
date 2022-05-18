@@ -23,13 +23,13 @@ import (
 	"github.com/sionreview/sion/common/logger"
 	protocol "github.com/sionreview/sion/common/types"
 	"github.com/sionreview/sion/common/util"
+	"github.com/sionreview/sion/common/util/hashmap"
 	"github.com/sionreview/sion/common/util/promise"
 	"github.com/sionreview/sion/lambda/invoker"
 	"github.com/sionreview/sion/proxy/collector"
 	"github.com/sionreview/sion/proxy/config"
 	"github.com/sionreview/sion/proxy/global"
 	"github.com/sionreview/sion/proxy/types"
-	"github.com/zhangjyr/hashmap"
 )
 
 const (
@@ -177,15 +177,16 @@ type Instance struct {
 	lambdaCanceller context.CancelFunc
 
 	// Connection management
-	lm       *LinkManager
-	sessions *hashmap.HashMap
-	due      int64
+	lm                *LinkManager
+	sessions          hashmap.HashMap
+	due               int64
+	reconcilingWorker int32 // The worker id of reconciling function.
 
 	// Backup fields
 	backups          Backups
-	recovering       uint32           // # of backups in use, also if the recovering > 0, the instance is recovering.
-	writtens         *hashmap.HashMap // Whitelist, write opertions will be added to it during parallel recovery.
-	backing          uint32           // backing status, 0 for non backing, 1 for reserved, 2 for backing.
+	recovering       uint32          // # of backups in use, also if the recovering > 0, the instance is recovering.
+	writtens         hashmap.HashMap // Whitelist, write opertions will be added to it during parallel recovery.
+	backing          uint32          // backing status, 0 for non backing, 1 for reserved, 2 for backing.
 	backingIns       *Instance
 	backingId        int // Identifier for backup, ranging from [0, # of backups)
 	backingTotal     int // Total # of backups ready for backing instance.
@@ -217,8 +218,8 @@ func NewInstanceFromDeployment(dp *Deployment, id uint64) *Instance {
 		coolTimer:    time.NewTimer(time.Duration(rand.Int63n(int64(WarmTimeout)) + int64(WarmTimeout)/2)), // Differentiate the time to start warming up.
 		coolTimeout:  WarmTimeout,
 		coolReset:    make(chan struct{}, 1),
-		sessions:     hashmap.New(TEMP_MAP_SIZE),
-		writtens:     hashmap.New(TEMP_MAP_SIZE),
+		sessions:     hashmap.NewMap(TEMP_MAP_SIZE),
+		writtens:     hashmap.NewMap(TEMP_MAP_SIZE),
 	}
 	ins.Meta.ResetCapacity(global.Options.GetInstanceCapacity(), 0)
 	ins.backups.instance = ins
@@ -534,7 +535,7 @@ func (ins *Instance) resumeServingLocked() {
 	ins.backups.Stop(ins)
 	// Clear whitelist during fast recovery.
 	if ins.writtens.Len() > 0 {
-		ins.writtens = hashmap.New(TEMP_MAP_SIZE)
+		ins.writtens = hashmap.NewMap(TEMP_MAP_SIZE)
 	}
 }
 
@@ -742,17 +743,16 @@ func (ins *Instance) getSid() string {
 }
 
 func (ins *Instance) initSession() string {
-	sid := ins.getSid()
-	ins.sessions.Set(sid, false)
-	return sid
+	return ins.getSid()
 }
 
 func (ins *Instance) startSession(sid string) bool {
-	return ins.sessions.Cas(sid, false, true)
+	_, started := ins.sessions.LoadOrStore(sid, true)
+	return !started
 }
 
 func (ins *Instance) endSession(sid string) {
-	ins.sessions.Del(sid)
+	ins.sessions.Delete(sid)
 }
 
 func castValidatedConnection(validated promise.Promise) (*Connection, error) {
@@ -785,7 +785,8 @@ func (ins *Instance) validate(opt *ValidateOption) (*Connection, error) {
 	if ctrlLink := ins.lm.GetControl(); ctrlLink != nil &&
 		(opt.Command == nil || opt.Command.Name() != protocol.CMD_PING) && // Time critical immediate ping
 		ins.validated.Error() == nil && lastOpt != nil && !lastOpt.WarmUp && // Lambda extended not thanks to warmup
-		atomic.LoadUint32(&ins.awakeness) == INSTANCE_ACTIVE && goodDue > 0 { // Lambda extended long enough to ignore ping.
+		atomic.LoadUint32(&ins.awakeness) == INSTANCE_ACTIVE && goodDue > 0 && // Lambda extended long enough to ignore ping.
+		ins.reconcilingWorker == 0 { // Reconcilation is required.
 		ins.mu.Unlock()
 		ins.log.Info("Validation skipped. due in %v", time.Duration(goodDue)+RTT)
 		return ctrlLink, nil // ctrl link can be replaced.
@@ -821,8 +822,15 @@ func (ins *Instance) validate(opt *ValidateOption) (*Connection, error) {
 			ctrl := ins.lm.GetControl() // Make a reference copy of ctrlLink to avoid it being changed.
 			if ctrl != nil {
 				if opt.Command != nil && opt.Command.Name() == protocol.CMD_PING {
+					// Extra ping request for time critical immediate ping.
 					ins.log.Debug("Ping with payload")
 					ctrl.SendPing(opt.Command.(*types.Control).Payload) // Ignore err, see comments below.
+				} else if ins.reconcilingWorker == ctrl.workerId {
+					// Confirm reconciling.
+					ins.log.Debug("Ping with reconcilation confirmation")
+					payload, _ := ins.Meta.ToPayload(ins.id)
+					ctrl.SendPing(payload) // Ignore err, see comments below.
+					ins.reconcilingWorker = 0
 				} else {
 					ctrl.SendPing(DefaultPingPayload) // Ignore err, see comments below.
 				}
@@ -1098,6 +1106,8 @@ func (ins *Instance) doTriggerLambda(opt *ValidateOption) error {
 		} else {
 			ins.log.Debug("Got staled instance lineage: %v", &outputStatus)
 		}
+		// Reset reconciling request after lambda returned.
+		ins.reconcilingWorker = 0
 	}
 	return nil
 }
@@ -1364,7 +1374,7 @@ func (ins *Instance) rerouteGetRequest(req *types.Request) bool {
 	}
 
 	// Written keys during recovery will not be rerouted.
-	if _, ok := ins.writtens.Get(req.Key); ok {
+	if _, ok := ins.writtens.Load(req.Key); ok {
 		ins.log.Debug("Detected reroute override for key %s", req.Key)
 		return false
 	}
@@ -1469,7 +1479,7 @@ func (ins *Instance) request(ctrlLink *Connection, cmd types.Command, validateDu
 		case protocol.CMD_DEL:
 			if ins.IsRecovering() {
 				ins.log.Debug("Override rerouting for key %s due to del", req.Key)
-				ins.writtens.Set(req.Key, &struct{}{})
+				ins.writtens.Store(req.Key, &struct{}{})
 			}
 		}
 		return ctrlLink.SendRequest(req, useDataLink, ins.lm) // Offer lm, so SendRequest is ctrl link free. (We still need to get ctrl link first to confirm lambda status.)
@@ -1486,7 +1496,7 @@ func (ins *Instance) request(ctrlLink *Connection, cmd types.Command, validateDu
 		case protocol.CMD_DEL:
 			if ins.IsRecovering() {
 				ins.log.Debug("Override rerouting for key %s due to del", req.Request.Key)
-				ins.writtens.Set(req.Request.Key, &struct{}{})
+				ins.writtens.Store(req.Request.Key, &struct{}{})
 			}
 		}
 
@@ -1589,4 +1599,12 @@ func (ins *Instance) getRerouteThreshold() uint64 {
 		ins.rerouteThreshold = ins.Meta.EffectiveCapacity() / uint64(ins.backups.Len()) / 2
 	}
 	return ins.rerouteThreshold
+}
+
+func (ins *Instance) reconcileStatus(conn *Connection, meta *protocol.ShortMeta) {
+	if meta.Term > ins.Meta.Term {
+		ins.log.Debug("Reconciling meta: %v", meta)
+		ins.Meta.Reconcile(meta)
+	}
+	ins.reconcilingWorker = conn.workerId // Track the worker that is reconciling.
 }

@@ -1,6 +1,6 @@
-# InfiniCache Client Library
+# Sion Client Library
 
-Client Library for [infinicache](https://github.com/sionreview/sion)
+Client Library for [SION](https://github.com/sionreview/sion)
 
 
 ## Examples

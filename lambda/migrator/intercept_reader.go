@@ -15,7 +15,7 @@ type InterceptReader struct {
 func NewInterceptReader(reader resp.AllReadCloser) *InterceptReader {
 	return &InterceptReader{
 		AllReadCloser: reader,
-		buf: make([]byte, reader.Len()),
+		buf:           make([]byte, reader.Len()),
 	}
 }
 

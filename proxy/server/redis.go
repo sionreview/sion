@@ -10,7 +10,7 @@ import (
 	"github.com/sionreview/sion/common/net"
 	"github.com/sionreview/sion/common/util"
 
-	infinicache "github.com/sionreview/sion/client"
+	sion "github.com/sionreview/sion/client"
 	protocol "github.com/sionreview/sion/common/types"
 	"github.com/sionreview/sion/proxy/collector"
 	"github.com/sionreview/sion/proxy/config"
@@ -65,30 +65,41 @@ func NewRedisAdapter(srv *redeo.Server, proxy *Proxy, d int, p int) *RedisAdapte
 		},
 	}
 
-	srv.HandleFunc(protocol.CMD_SET, adapter.handleSet)
+	srv.HandleStreamFunc(protocol.CMD_SET, adapter.handleSet)
 	srv.HandleFunc(protocol.CMD_GET, adapter.handleGet)
 
 	return adapter
 }
 
 // from client
-func (a *RedisAdapter) handleSet(w resp.ResponseWriter, c *resp.Command) {
+func (a *RedisAdapter) handleSet(w resp.ResponseWriter, c *resp.CommandStream) {
 	client := a.getClient(redeo.GetClient(c.Context()))
 
-	key := c.Arg(0).String()
-	body := c.Arg(1).Bytes()
+	key, _ := c.NextArg().String()
+	bodyReader, err := c.Next()
+	if err != nil {
+		w.AppendError(err.Error())
+		w.Flush()
+		return
+	}
+	body, err := bodyReader.ReadAll()
+	if err != nil {
+		w.AppendError(err.Error())
+		w.Flush()
+		return
+	}
 
 	t := time.Now()
-	_, ok := client.EcSet(key, body)
+	_, err = client.EcSet(key, body)
 	dt := time.Since(t)
-	if !ok {
-		w.AppendErrorf("failed to set %s", key)
+	if err != nil {
+		w.AppendError(err.Error())
 		w.Flush()
 	} else {
 		w.AppendInlineString("OK")
 		w.Flush()
 	}
-	collector.Collect(collector.LogEndtoEnd, protocol.CMD_SET, util.Ifelse(ok, "200", "500"),
+	collector.Collect(collector.LogEndtoEnd, protocol.CMD_SET, util.Ifelse(err == nil, "200", "500"),
 		int64(len(body)), t.UnixNano(), int64(dt))
 }
 
@@ -98,21 +109,20 @@ func (a *RedisAdapter) handleGet(w resp.ResponseWriter, c *resp.Command) {
 	key := c.Arg(0).String()
 
 	t := time.Now()
-	_, reader, ok := client.EcGet(key)
+	_, reader, err := client.EcGet(key)
 	dt := time.Since(t)
 	code := "500"
 	size := 0
-	if !ok {
-		w.AppendErrorf("failed to get %s", key)
-		w.Flush()
-	} else if reader == nil {
+	if err == sion.ErrNotFound {
 		w.AppendNil()
 		w.Flush()
 		code = "404"
+	} else if err != nil {
+		w.AppendError(err.Error())
+		w.Flush()
 	} else {
 		size = reader.Len()
 		if err := w.CopyBulk(reader, int64(size)); err != nil {
-			ok = false
 			a.log.Warn("Error on sending %s: %v", key, err)
 		}
 		reader.Close()
@@ -121,7 +131,7 @@ func (a *RedisAdapter) handleGet(w resp.ResponseWriter, c *resp.Command) {
 	collector.Collect(collector.LogEndtoEnd, protocol.CMD_GET, code, int64(size), t.UnixNano(), int64(dt))
 }
 
-func (a *RedisAdapter) getClient(redeoClient *redeo.Client) *infinicache.Client {
+func (a *RedisAdapter) getClient(redeoClient *redeo.Client) *sion.Client {
 	shortcut := net.Shortcut.Prepare(a.localAddr, int(redeoClient.ID()), a.d+a.p)
 	if shortcut.Client == nil {
 		var addresses []string
@@ -133,7 +143,7 @@ func (a *RedisAdapter) getClient(redeoClient *redeo.Client) *infinicache.Client 
 			addresses[a.localIdx] = shortcut.Address
 		}
 
-		client := infinicache.NewClient(a.d, a.p, ECMaxGoroutine)
+		client := sion.NewClient(a.d, a.p, ECMaxGoroutine)
 		shortcut.Client = client
 		shortcut.OnValidate = func(mock *net.MockConn) {
 			go a.server.ServeForeignClient(mock.Server, false)
@@ -148,7 +158,7 @@ func (a *RedisAdapter) getClient(redeoClient *redeo.Client) *infinicache.Client 
 			net.Shortcut.Invalidate(shortcut)
 		}()
 	}
-	return shortcut.Client.(*infinicache.Client)
+	return shortcut.Client.(*sion.Client)
 }
 
 func (a *RedisAdapter) Close() {
