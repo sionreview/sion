@@ -6,7 +6,7 @@
 
 - ### EC2 Proxy
 
-  Amazon EC2 AMI: ubuntu-xenial-16.04
+  Amazon EC2 AMI: ubuntu-xenial-18.04
 
   Golang version: 1.16
 
@@ -30,7 +30,7 @@
 
   Clone this repo
   ```go
-  go get -u github.com/sionreview/sion
+  git clone https://github.com/sionreview/sion.git
   ```
 
   Run `aws configure` to setup your AWS credential.
@@ -57,6 +57,8 @@
 
   Plese [refer to this article](https://aws.amazon.com/premiumsupport/knowledge-center/internet-access-lambda-function/). (You could skip this step if you do not want to run InfiniCache under VPC).
 
+  We prepared scripts to help you create/delete NAT gateway in the "deploy" folder.
+
 - ### S3
 
   Create the S3 bucket to store the zip file of the Lambda code and data output from Lambda functions. Remember the name of this bucket for the configuration in next step.
@@ -67,16 +69,16 @@
 
   Edit `deploy/create_function.sh` and `deploy/update_function.sh`
   ```shell
-  PREFIX="your lambda function prefix"
+  DEPLOY_PREFIX="your lambda function prefix"
+  DEPLOY_CLUSTER=1000 # The number of Lambda deployments used for window rotation.
+  DEPLOY_MEM=1536 # The memory of Lambda deployments.
   S3="your bucket name"
-  cluster=1000 # number of lambda for window rotation.
-  mem=1536
   ```
 
   Edit destination S3 bucket in `lambda/config.go`, these buckets are for data collection and durable storage.
   ```go
   S3_COLLECTOR_BUCKET = "your data collection bucket"
-  S3_BACKUP_BUCKET = "your COS bucket"
+  S3_BACKUP_BUCKET = "your COS bucket%s"  // Leave %s at the end your COS bucket.
   ```
 
   Edit the aws settings and the VPC configuration in `deploy/deploy_function.go`. If you do not want to run InfiniCache under VPC, you do not need to modify the `subnet` and `securityGroup` settings.
@@ -95,12 +97,13 @@
   }
   ```
 
-  Run script to create and deploy lambda functions (Also, if you do not want to run InfiniCache under VPC, you need to set the `vpc` flag to be `false` in `deploy/create_function.sh`).
+  Run script to create and deploy lambda functions (Also, if you do not want to run InfiniCache under VPC, 
+  you need to remove the `--no-vpc` flag on executing `deploy/create_function.sh`).
 
   ```shell
   export GO111MODULE="on"
   go get
-  deploy/create_function.sh 600
+  deploy/create_function.sh --no-vpc 600
   ```
 
   #### Proxy configuration
