@@ -55,7 +55,7 @@
 
   #### Enable Lambda internet access under VPC
 
-  Plese [refer to this article](https://aws.amazon.com/premiumsupport/knowledge-center/internet-access-lambda-function/). (You could skip this step if you do not want to run InfiniCache under VPC).
+  Plese [refer to this article](https://aws.amazon.com/premiumsupport/knowledge-center/internet-access-lambda-function/). (You could skip this step if you do not want to run SION under VPC).
 
   We prepared scripts to help you create/delete NAT gateway in the "deploy" folder.
 
@@ -81,7 +81,7 @@
   S3_BACKUP_BUCKET = "your COS bucket%s"  // Leave %s at the end your COS bucket.
   ```
 
-  Edit the aws settings and the VPC configuration in `deploy/deploy_function.go`. If you do not want to run InfiniCache under VPC, you do not need to modify the `subnet` and `securityGroup` settings.
+  Edit the aws settings and the VPC configuration in `deploy/deploy_function.go`. If you do not want to run SION under VPC, you do not need to modify the `subnet` and `securityGroup` settings.
 
   ```go
   ROLE = "arn:aws:iam::[aws account id]:role/[role name]"
@@ -97,7 +97,7 @@
   }
   ```
 
-  Run script to create and deploy lambda functions (Also, if you do not want to run InfiniCache under VPC, 
+  Run script to create and deploy lambda functions (Also, if you do not want to run SION under VPC, 
   you need to remove the `--no-vpc` flag on executing `deploy/create_function.sh`).
 
   ```shell
@@ -126,7 +126,7 @@
   make start
   ```
 
-  To stop proxy server, run `make stop`. If `make stop` is not working, you could use `pgrep proxy`, `pgrep go` to find the pid, and check the `infinicache pid` and kill them.
+  To stop proxy server, run `make stop`. If `make stop` is not working, you could use `pgrep proxy`, `pgrep go` to find the pid, and check the `sion pid` and kill them.
 
 - Client library
 
