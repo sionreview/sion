@@ -39,11 +39,20 @@ function perform(){
 	sleep 1s
 
 	# playback
-	if [ "$CMD" == "exec" ] ; then
-		$FILE $PLAY_PARAMS --prefix ${PREPROXY}
-	else
-		playback "-cluster=$CLUSTER -file=$PREPROXY $COMPACT $PLAY_PARAMS" $FILE
-	fi
+	PLAYBACK_RET=1
+	RETRIAL=0
+	while [ $PLAYBACK_RET -ne 0 -a $RETRIAL -lt 10 ]	# limit to 10 retrials
+	do
+		if [ "$CMD" == "exec" ] ; then
+			$FILE $PLAY_PARAMS --prefix ${PREPROXY}
+			PLAYBACK_RET=0 # exec mode does not support checkpoint
+		else
+			((RETRIAL=RETRIAL+1)) # Update retrial for different runs to avoid the collision of output data.
+			playback "-cluster=$CLUSTER -file=$PREPROXY-$RETRIAL $COMPACT $PLAY_PARAMS -checkpoint=$ENTRY.checkpoint" $FILE
+			PLAYBACK_RET=$?
+			echo "playback return $PLAYBACK_RET"
+		fi
+	done
 	
 	# stop proxy
 	kill -2 `cat $PID`
@@ -81,9 +90,32 @@ function dry_perform(){
 	$FILE $PLAY_PARAMS --prefix ${PREPROXY}
 }
 
+function custom(){
+	FILE=$2
+	CLUSTER=$3
+	PLAY_PARAMS=$4
+
+	PREPROXY=$PWD/$ENTRY/simulate-$CLUSTER
+
+	# playback
+	PLAYBACK_RET=1
+	RETRIAL=0
+	while [ $PLAYBACK_RET -ne 0 -a $RETRIAL -lt 10 ]	# limit to 10 retrials
+	do
+		((RETRIAL=RETRIAL+1)) # Update retrial for different runs to avoid the collision of output data.
+		playback "-file=$PREPROXY-$RETRIAL $PLAY_PARAMS -checkpoint=$ENTRY.checkpoint" $FILE
+		PLAYBACK_RET=$?
+		echo "playback return $PLAYBACK_RET"
+	done
+}
+
 if [ "$1" == "dryrun" ]; then
 	echo "Dry run"
 	dry_perform "$1" "$2" "$3" "$4" "$5" "$6" "$7"
+elif [ "$1" == "custom" ]; then
+	echo "Custom"
+	custom "$1" "$2" "$3" "$4"
+	mv $PWD/log $PWD/$ENTRY.log
 else
 	mkdir -p $PWD/$ENTRY
 	CLUSTER=$3

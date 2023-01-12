@@ -5,6 +5,7 @@ import (
 
 	"github.com/sionreview/sion/proxy/lambdastore"
 	"github.com/sionreview/sion/proxy/server/metastore"
+	"github.com/sionreview/sion/proxy/types"
 )
 
 var (
@@ -22,4 +23,9 @@ type Cluster interface {
 	GetPlacer() metastore.Placer
 	CollectData()
 	Close()
+}
+
+type ServerProvider interface {
+	GetServePort(uint64) int
+	GetPersistCache() types.PersistCache
 }

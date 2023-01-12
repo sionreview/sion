@@ -64,3 +64,8 @@ func NewPromise() Promise {
 func NewPromiseWithOptions(opts interface{}) Promise {
 	return NewChannelPromiseWithOptions(opts)
 }
+
+// Recycle returns the promise to the pool.
+func Recycle(p Promise) {
+	// TODO: recycle
+}

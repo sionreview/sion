@@ -8,7 +8,7 @@
 
   Amazon EC2 AMI: ubuntu-xenial-18.04
 
-  Golang version: 1.16
+  Golang version: 1.18
 
   Be sure the port **6378 - 6379** is avaiable on the proxy
 

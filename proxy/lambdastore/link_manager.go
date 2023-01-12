@@ -15,7 +15,11 @@ import (
 const (
 	LinkBucketSize       = 10
 	UnlimitedActiveLinks = 0
-	ActiveLinks          = 1
+	// Max spare links
+	// Set to 2 to reserve 1 for ready and 1 for buffering.
+	// Set to MAX_CONCURRENCY + 1 to avoid links being frenquently closed and re-created.
+	// Can be override dynamically by instance.SetMaxActiveDataLinks().
+	ActiveLinks = 2
 )
 
 var (
@@ -148,7 +152,7 @@ func (m *LinkManager) addDataLinkLocked(link *Connection, cache bool) bool {
 func (m *LinkManager) RemoveDataLink(link *Connection) {
 	m.dataLinks.Delete(link.Id)
 	m.log.Debug("Data link removed:%v, availables: %d, all: %d", link, m.availables.Len(), m.dataLinks.Len())
-	// Data link being removed can be in avaiables already, we ignore this by considering following cases:
+	// Data link being removed can be in avaiables already, we argue this is unlikely because:
 	// 1. New datalink will not be disconnected before first use.
 	// 2. Reuse datalink will be closed (beyond ActiveLinks) and will not be added to availables.
 	// 3. On function exists, all data links will be removed, and then resetLocked will be called sometime.
@@ -166,8 +170,7 @@ func (m *LinkManager) FlagAvailableForRequest(link *Connection) bool {
 	if added {
 		m.log.Debug("Data link reused:%v, availables: %d, all: %d", link, m.availables.Len(), m.dataLinks.Len())
 	} else {
-		m.RemoveDataLink(link)
-		// Directly close connection for grace close. The link will close afterward.
+		// Gracely close the connection, it will be removed from the LinkManager.
 		link.Conn.Close()
 	}
 	return added
@@ -381,6 +384,7 @@ func (l *AvailableLinks) GetRequestPipe() *AvailableLink {
 				}
 			}
 		}
+		// Unlikely but possible on timeout.
 		if al.link == nil {
 			al.links.resetLinkRequest(al, ErrNilLink)
 			return

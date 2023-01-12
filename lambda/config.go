@@ -6,12 +6,15 @@ import (
 )
 
 const (
-	LIFESPAN = 5 * time.Minute
+	LIFESPAN = 5 * time.Minute      // Not effective for now
+	MIN_TICK = 1 * time.Millisecond // Set to 100ms to compare with legacy system.
 )
 
 var (
+	// Bucket to store experiment data. No date will be stored if InputEvent.Prefix is not set.
 	S3_COLLECTOR_BUCKET string = "sionreview.datapool"
-	S3_BACKUP_BUCKET    string = "sion.backup%s" // Leave "%s" alone at the end of the bucket.
+	// Bucket to store persistent data. Keep "%s" at the end of the bucket name.
+	S3_BACKUP_BUCKET string = "sion.backup%s"
 
 	DRY_RUN = false
 )

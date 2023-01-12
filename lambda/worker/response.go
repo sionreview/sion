@@ -18,7 +18,9 @@ var (
 	ResponseTimeout = 100 * time.Millisecond
 )
 
-type Preparer func(*SimpleResponse, resp.ResponseWriter)
+// Response filler to simplify response construction. If an error is returned, the response will be discarded,
+// and the connection will be closed except an ErrShouldIgnore is returned.
+type Preparer func(*SimpleResponse, resp.ResponseWriter) error
 
 type Response interface {
 	redeo.Contextable
@@ -29,7 +31,12 @@ type Response interface {
 	// Prepare overwrite to customize fields of a Response.
 	Prepare()
 
-	// Flush wait for flushing.
+	// Flush waits for the response to be received by the proxy.
+	// Because the data will be written to a buffer and return immediately, a successful "flush"
+	// may not guarantee that the data has been received by the proxy. In a function, the function
+	// can be suspended any time and leave the data in the middle of the network stack, which may lead
+	// to unexpected behavior. To avoid this, an acknowledgement is required to ensure that the data
+	// has been received by the proxy. On timeout, the link will be closed.
 	Flush() error
 
 	// Size overwrite to return the size of a Response.
@@ -87,9 +94,17 @@ func (r *BaseResponse) Prepare() {
 }
 
 func (r *BaseResponse) Flush() error {
+	if r.err != nil {
+		return r.err
+	}
 	// Timeout added here, sometimes redeo may not handle all responses.
 	r.done.SetTimeout(r.getTimeout())
-	return r.done.Timeout()
+	err := r.done.Timeout()
+	if err != nil {
+		return err
+	} else {
+		return r.done.Error()
+	}
 }
 
 func (r *BaseResponse) Size() int64 {
@@ -136,9 +151,12 @@ func (r *BaseResponse) flush(writer resp.ResponseWriter) error {
 	r.ResponseWriter = writer
 	r.err = nil
 	if r.preparer != nil {
-		r.preparer(r.inst.(*SimpleResponse), writer)
+		r.err = r.preparer(r.inst.(*SimpleResponse), writer)
 	} else {
 		r.inst.Prepare()
+	}
+	if r.err != nil {
+		return r.err
 	}
 
 	client := redeo.GetClient(r.Context())
@@ -211,7 +229,8 @@ func (r *BaseResponse) close() {
 }
 
 func (r *BaseResponse) resolve() {
-	r.done.Resolve(&struct{}{})
+	// Resolve with last error.
+	r.done.Resolve(nil, r.err)
 }
 
 type SimpleResponse struct {

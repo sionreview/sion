@@ -20,11 +20,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/mason-leap-lab/go-utils"
 	"github.com/mason-leap-lab/go-utils/mapreduce"
+	"github.com/mason-leap-lab/go-utils/promise"
+	"github.com/mason-leap-lab/redeo/resp"
 	"github.com/sionreview/sion/common/logger"
 	protocol "github.com/sionreview/sion/common/types"
 	"github.com/sionreview/sion/common/util"
 	"github.com/sionreview/sion/common/util/hashmap"
-	"github.com/sionreview/sion/common/util/promise"
 	"github.com/sionreview/sion/lambda/invoker"
 	"github.com/sionreview/sion/proxy/collector"
 	"github.com/sionreview/sion/proxy/config"
@@ -70,12 +71,14 @@ const (
 	// Abnormal status
 	FAILURE_MAX_QUEUE_REACHED = 1
 
-	MAX_CMD_QUEUE_LEN = 5
-	TEMP_MAP_SIZE     = 10
-	BACKING_DISABLED  = 0
-	BACKING_RESERVED  = 1
-	BACKING_ENABLED   = 2
-	BACKING_FORBID    = 3
+	MAX_CONCURRENCY  = 2
+	IN_CONCURRENCY   = 1
+	OUT_CONCURRENCY  = 2
+	TEMP_MAP_SIZE    = 10
+	BACKING_DISABLED = 0
+	BACKING_RESERVED = 1
+	BACKING_ENABLED  = 2
+	BACKING_FORBID   = 3
 
 	DESCRIPTION_UNSTARTED  = "unstarted"
 	DESCRIPTION_CLOSED     = "closed"
@@ -87,16 +90,24 @@ const (
 
 	DISPATCH_OPT_BUSY_CHECK = 0x0001
 	DISPATCH_OPT_RELOCATED  = 0x0002
+
+	NUM_REQUEST_UNIT       = 0x0000000000000001
+	NUM_WRITE_REQUEST_UNIT = 0x0000000100000000
+	NUM_REQUEST_MASK       = 0x00000000FFFFFFFF
+	NUM_WRITE_REQUEST_MASK = 0xFFFFFFFF00000000
+	NUM_WRITE_REQUEST_BITS = 32
 )
 
 var (
-	CM                    ClusterManager
-	WarmTimeout           = config.InstanceWarmTimeout
-	TriggerTimeout        = 1 * time.Second // Triggering cost is about 20ms, set large enough to avoid exceeded timeout
-	RTT                   = 2 * time.Millisecond
-	DefaultConnectTimeout = 20 * time.Millisecond // Decide by RTT.
+	CM             ClusterManager
+	WarmTimeout    = config.InstanceWarmTimeout
+	TriggerTimeout = 1 * time.Second // Triggering cost is about 20ms, set large enough to avoid exceeded timeout
+	// TODO: Make RTT dynamic, global or per instance.
+	RTT                   = 20 * time.Millisecond
+	DefaultConnectTimeout = 200 * time.Millisecond // Decide by RTT.
 	MaxConnectTimeout     = 1 * time.Second
-	MinValidationInterval = 10 * time.Millisecond // MinValidationInterval The minimum interval between validations.
+	PromisedGoodDue       = 1 * time.Second // Keep consistent with lambda/lifetime/timeout.TICK_ERROR_EXTEND
+	MinValidationInterval = RTT             // MinValidationInterval The minimum interval between validations.
 	MaxValidationFailure  = 3
 	BackoffFactor         = 2
 	MaxControlRequestSize = int64(200000) // 200KB, which can be transmitted in 20ms.
@@ -128,6 +139,8 @@ type InstanceManager interface {
 	Recycle(types.LambdaDeployment) error
 	GetBackupCandidates() mapreduce.Iterator
 	GetDelegates() []*Instance
+	GetServePort(uint64) int
+	GetPersistCache() types.PersistCache
 }
 
 type Relocator interface {
@@ -159,14 +172,14 @@ type Instance struct {
 	*Deployment
 	Meta
 
+	port            int // The port the instance can connect to.
 	chanCmd         chan types.Command
 	chanPriorCmd    chan types.Command // Channel for priority commands: control and forwarded backing requests.
 	status          uint32             // Status of proxy side instance which can be one of unstarted, running, and closed.
 	awakeness       uint32             // Status of lambda node which can be one of sleeping, activating, active, and maybe.
 	phase           uint32             // Status of serving mode which can be one of active, backing only, reclaimed, and expired.
 	validated       promise.Promise
-	numOutbound     int32
-	numInbound      int32
+	numRequests     uint64
 	mu              sync.Mutex
 	closed          chan struct{}
 	coolTimer       *time.Timer
@@ -180,6 +193,7 @@ type Instance struct {
 	lm                *LinkManager
 	sessions          hashmap.HashMap
 	due               int64
+	delayedDue        int64 // Cached due that will not be set until there is no serving request.
 	reconcilingWorker int32 // The worker id of reconciling function.
 
 	// Backup fields
@@ -199,11 +213,7 @@ type Instance struct {
 
 func NewInstanceFromDeployment(dp *Deployment, id uint64) *Instance {
 	dp.id = id
-	dp.log = &logger.ColorLogger{
-		Prefix: fmt.Sprintf("%s-%d ", dp.name, dp.id),
-		Level:  global.Log.GetLevel(),
-		Color:  !global.Options.NoColor,
-	}
+	dp.log = global.GetLogger(fmt.Sprintf("%s-%d ", dp.name, dp.id))
 
 	ins := &Instance{
 		Deployment: dp,
@@ -211,7 +221,7 @@ func NewInstanceFromDeployment(dp *Deployment, id uint64) *Instance {
 			Term: 1,
 		}, // Term start with 1 to avoid uninitialized term ambigulous.
 		awakeness:    INSTANCE_SLEEPING,
-		chanCmd:      make(chan types.Command, MAX_CMD_QUEUE_LEN),
+		chanCmd:      make(chan types.Command, MAX_CONCURRENCY-1),
 		chanPriorCmd: make(chan types.Command, 1),
 		validated:    promise.Resolved(), // Initialize with a resolved promise.
 		closed:       make(chan struct{}),
@@ -225,7 +235,8 @@ func NewInstanceFromDeployment(dp *Deployment, id uint64) *Instance {
 	ins.backups.instance = ins
 	ins.backups.log = ins.log
 	ins.lm = NewLinkManager(ins)
-	ins.lm.SetMaxActiveDataLinks(MAX_CMD_QUEUE_LEN)
+	ins.lm.SetMaxActiveDataLinks(MAX_CONCURRENCY + 1)
+	ins.port = CM.GetServePort(id)
 	return ins
 }
 
@@ -254,9 +265,6 @@ func (ins *Instance) Status() uint64 {
 	}
 	if ins.IsBacking(true) {
 		backing += INSTANCE_BACKING
-	}
-	if len(ins.chanCmd) == MAX_CMD_QUEUE_LEN {
-		failure += FAILURE_MAX_QUEUE_REACHED
 	}
 	// 0xF000  lifecycle
 	return uint64(atomic.LoadUint32(&ins.status)) +
@@ -323,7 +331,12 @@ func (ins *Instance) DispatchWithOptions(cmd types.Command, opts int) error {
 		}
 	}
 
-	ins.log.Debug("Dispatching %v, %d queued", cmd, len(ins.chanCmd))
+	n, busy := ins.setBusy(cmd) // setBusy will fail if busy.
+	ins.log.Debug("Dispatching %v, %d queued, busy: %v", cmd, ins.numBusying(n), busy)
+	if opts&DISPATCH_OPT_BUSY_CHECK > 0 && busy {
+		return ErrInstanceBusy
+	}
+
 	select {
 	case ins.chanCmd <- cmd:
 		// continue after select
@@ -333,9 +346,11 @@ func (ins *Instance) DispatchWithOptions(cmd types.Command, opts int) error {
 		}
 
 		// wait to be inserted and continue after select
+		ins.addBusy(cmd)
 		select {
 		case ins.chanCmd <- cmd:
 		case <-time.After(protocol.GetHeaderTimeout()):
+			ins.doneBusy(cmd)
 			return ErrQueueTimeout
 		}
 	}
@@ -349,14 +364,31 @@ func (ins *Instance) DispatchWithOptions(cmd types.Command, opts int) error {
 	return nil
 }
 
-func (ins *Instance) IsBusy(cmd types.Command) bool {
-	if len(ins.chanCmd) >= MAX_CMD_QUEUE_LEN {
+func (ins *Instance) mustDispatch(cmd types.Command) {
+	ins.addBusy(cmd.GetRequest()) // addBusy will not failed
+	ins.chanPriorCmd <- cmd
+}
+
+func (ins *Instance) shouldDispatch(cmd types.Command) bool {
+	ins.addBusy(cmd.GetRequest()) // addBusy will not failed
+	select {
+	case ins.chanPriorCmd <- cmd:
 		return true
-	} else if cmd.String() == protocol.CMD_SET {
-		return atomic.LoadInt32(&ins.numOutbound) > 0
-	} else {
+	default:
+		ins.doneBusy(cmd.GetRequest()) // rollback
 		return false
 	}
+}
+
+func (ins *Instance) IsBusy(cmd types.Command) (uint64, bool) {
+	status := atomic.LoadUint64(&ins.numRequests)
+	// Validate if the command is a request, control commands that wraps a request will be ignored.
+	req, _ := cmd.(*types.Request)
+	if req == nil {
+		return status, false
+	}
+
+	return ins.isBusy(status, req.Cmd == protocol.CMD_SET)
 }
 
 func (ins *Instance) WarmUp() {
@@ -369,7 +401,7 @@ func (ins *Instance) IsActive() bool {
 	return atomic.LoadUint32(&ins.awakeness) == INSTANCE_ACTIVE
 }
 
-func (ins *Instance) Validate(opts ...*ValidateOption) (*Connection, error) {
+func (ins *Instance) Validate(opts ...*ValidateOption) (*Connection, time.Duration, error) {
 	var opt *ValidateOption
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -591,10 +623,10 @@ func (ins *Instance) StartBacking(bakIns *Instance, bakId int, total int) bool {
 	if err != nil {
 		ins.log.Warn("Failed to prepare payload to trigger recovery: %v", err)
 	} else {
-		ins.chanPriorCmd <- &types.Control{
+		ins.mustDispatch(&types.Control{
 			Cmd:     protocol.CMD_PING,
 			Payload: payload,
-		}
+		})
 	}
 	return true
 }
@@ -714,9 +746,16 @@ func (ins *Instance) closeLocked() {
 	// Close all links.
 	ins.lm.Close()
 
-	// We can't reset components to nil, for lambda can still running.
+	// Close function if necessary
+	if ins.client != nil {
+		if closer, ok := ins.client.(invoker.FunctionCloser); ok {
+			closer.Close()
+		}
+		ins.client = nil
+	}
 
-	ins.log.Info("[%v]Closed", ins)
+	// We can't reset components to nil, for lambda can still running.
+	ins.log.Debug("[%v]Closed", ins)
 
 	// Recycle instance
 	CM.Recycle(ins)
@@ -755,23 +794,23 @@ func (ins *Instance) endSession(sid string) {
 	ins.sessions.Delete(sid)
 }
 
-func castValidatedConnection(validated promise.Promise) (*Connection, error) {
+func castValidatedConnection(validated promise.Promise) (*Connection, time.Duration, error) {
 	cn, err := validated.Result()
 	if cn == nil {
-		return nil, err
+		return nil, 0, err
 	} else {
-		return cn.(*Connection), err
+		return cn.(*Connection), PromisedGoodDue, err
 	}
 }
 
-func (ins *Instance) validate(opt *ValidateOption) (*Connection, error) {
+func (ins *Instance) validate(opt *ValidateOption) (*Connection, time.Duration, error) {
 	ins.mu.Lock()
 
 	// Closed safe: The only closed check that in the mutex.
 	// See comments started with "Closed safe: " below for more detail.
 	if ins.IsClosed() {
 		ins.mu.Unlock()
-		return nil, ErrInstanceClosed
+		return nil, 0, ErrInstanceClosed
 	}
 
 	// 1. Unresolved: wait for validation result.
@@ -781,15 +820,16 @@ func (ins *Instance) validate(opt *ValidateOption) (*Connection, error) {
 		return castValidatedConnection(ins.validated)
 	}
 	lastOpt, _ := ins.validated.Options().(*ValidateOption)
-	goodDue := time.Duration(ins.due - time.Now().Add(RTT).UnixNano())
+	goodDue := time.Duration(ins.due - time.Now().UnixNano()) // Proxy don't need to consider RTT, it has been deducted from the feedback.
 	if ctrlLink := ins.lm.GetControl(); ctrlLink != nil &&
-		(opt.Command == nil || opt.Command.Name() != protocol.CMD_PING) && // Time critical immediate ping
-		ins.validated.Error() == nil && lastOpt != nil && !lastOpt.WarmUp && // Lambda extended not thanks to warmup
+		(opt.Command == nil || opt.Command.Name() != protocol.CMD_PING) && // Except time-critical immediate ping.
+		ins.validated.Error() == nil && // Last validation succeeded.
+		lastOpt != nil && !lastOpt.WarmUp && // Lambda extended not thanks to warmup.
 		atomic.LoadUint32(&ins.awakeness) == INSTANCE_ACTIVE && goodDue > 0 && // Lambda extended long enough to ignore ping.
-		ins.reconcilingWorker == 0 { // Reconcilation is required.
+		ins.reconcilingWorker == 0 { // Reconcilation is not required.
 		ins.mu.Unlock()
-		ins.log.Info("Validation skipped. due in %v", time.Duration(goodDue)+RTT)
-		return ctrlLink, nil // ctrl link can be replaced.
+		ins.log.Debug("Validation skipped. due in %v", time.Duration(goodDue))
+		return ctrlLink, goodDue, nil // ctrl link can be replaced.
 	}
 
 	// For reclaimed instance, simply return the result of last validation.
@@ -804,14 +844,14 @@ func (ins *Instance) validate(opt *ValidateOption) (*Connection, error) {
 	connectTimeout := DefaultConnectTimeout
 	// for::attemps
 	for {
-		ins.log.Debug("Validating...")
+		ins.log.Info("Validating..., due in %v", goodDue)
 		// Try invoking the lambda node.
 		// Closed safe: It is ok to invoke lambda, closed status will be checked in TryFlagValidated on processing the PONG.
 		triggered := ins.tryTriggerLambda(ins.validated.Options().(*ValidateOption))
 		if triggered {
 			// Pass to timeout check.
 			ins.validated.SetTimeout(TriggerTimeout)
-			connectTimeout /= time.Duration(BackoffFactor) // Deduce by factor, so the timeout of next attempt (ping) start from DefaultConnectTimeout.
+			connectTimeout = DefaultConnectTimeout // Reset timeout to defaultConnectTimeout.
 		} else if opt.WarmUp && !global.IsWarmupWithFixedInterval() {
 			// Instance is warm, skip unnecssary warming up.
 			return ins.flagValidatedLocked(ins.lm.GetControl()) // Skip any check in the "FlagValidated".
@@ -881,9 +921,9 @@ func (ins *Instance) tryTriggerLambda(opt *ValidateOption) bool {
 	}
 
 	if opt.WarmUp {
-		ins.log.Info("[%v]Warming up...", ins)
+		ins.log.Debug("[%v]Warming up...", ins)
 	} else {
-		ins.log.Info("[%v]Activating...", ins)
+		ins.log.Debug("[%v]Activating...", ins)
 	}
 	go ins.triggerLambda(opt)
 
@@ -902,7 +942,7 @@ func (ins *Instance) triggerLambda(opt *ValidateOption) {
 		// Handle reclaimation
 		if err != nil && err == ErrInstanceReclaimed {
 			atomic.StoreUint32(&ins.phase, PHASE_RECLAIMED)
-			ins.log.Info("Reclaimed")
+			ins.log.Debug("Reclaimed")
 
 			// Initiate delegation.
 			ins.StartDelegation()
@@ -941,16 +981,16 @@ func (ins *Instance) triggerLambda(opt *ValidateOption) {
 			// Validating, retrigger.
 			atomic.StoreUint32(&ins.awakeness, INSTANCE_ACTIVATING)
 
-			// Added by sion: Since lambda is stopped, do some cleanup
+			// Added by Tianium: Since lambda is stopped, do some cleanup
 			ins.lm.Reset()
 
-			ins.log.Info("[%v]Reactivateing...", ins)
+			ins.log.Debug("[%v]Reactivateing...", ins)
 			err = ins.doTriggerLambda(ins.validated.Options().(*ValidateOption))
 			awakeness = atomic.LoadUint32(&ins.awakeness)
 		}
 	}
 
-	// Added by sion: Since lambda is stopped, do some cleanup
+	// Added by Tianium: Since lambda is stopped, do some cleanup
 	ins.lm.Reset()
 }
 
@@ -959,11 +999,14 @@ func (ins *Instance) doTriggerLambda(opt *ValidateOption) error {
 		// TODO: Check stale status
 		ins.log.Warn("Detected stale meta: %d", ins.Meta.Term)
 	}
-	switch global.Options.GetInvoker() {
-	case global.InvokerLocal:
-		ins.client = &invoker.LocalInvoker{}
-	default:
-		ins.client = lambda.New(AwsSession, &aws.Config{Region: aws.String(config.AWSRegion)})
+
+	if ins.client == nil {
+		switch global.Options.GetInvoker() {
+		case global.InvokerLocal:
+			ins.client = &invoker.LocalInvoker{}
+		default:
+			ins.client = lambda.New(AwsSession, &aws.Config{Region: aws.String(config.AWSRegion)})
+		}
 	}
 
 	tips := &url.Values{}
@@ -996,9 +1039,9 @@ func (ins *Instance) doTriggerLambda(opt *ValidateOption) error {
 	// Check extra one time store status (eg. delegate store)
 	ins.log.Debug("invoke with command: %v", opt.Command)
 	if opt.Command != nil {
-		// ins.log.Info("command with info: %v", opt.Command.GetInfo())
+		// ins.log.Debug("command with info: %v", opt.Command.GetInfo())
 		if meta, ok := opt.Command.GetInfo().(*protocol.Meta); ok {
-			// ins.log.Info("meta added: %v", meta)
+			// ins.log.Debug("meta added: %v", meta)
 			status.Metas = append(status.Metas, *meta)
 		}
 	}
@@ -1011,10 +1054,10 @@ func (ins *Instance) doTriggerLambda(opt *ValidateOption) error {
 		Sid:     ins.initSession(),
 		Cmd:     protocol.CMD_PING,
 		Id:      ins.Id(),
-		Proxy:   fmt.Sprintf("%s:%d", global.ServerIp, global.BasePort+1),
+		Proxy:   fmt.Sprintf("%s:%d", global.ServerIp, ins.port),
 		Prefix:  global.Options.Prefix,
-		Log:     global.Log.GetLevel(),
-		Flags:   global.Flags | localFlags,
+		Log:     global.Options.GetLambdaLogLevel(),
+		Flags:   global.LambdaFlags | localFlags,
 		Backups: config.BackupsPerInstance,
 		Status:  status,
 	}
@@ -1041,7 +1084,6 @@ func (ins *Instance) doTriggerLambda(opt *ValidateOption) error {
 	ins.lambdaCanceller = cancel
 	ins.mu.Unlock()
 	output, err := ins.client.InvokeWithContext(ctx, input)
-	ins.client = nil
 	ins.mu.Lock()
 	ins.lambdaCanceller = nil
 	ins.mu.Unlock()
@@ -1154,13 +1196,13 @@ func (ins *Instance) AbandonLambda() {
 
 // Flag the instance as validated by specified connection.
 // This also validate the connection belonging to the instance by setting instance field of the connection.
-func (ins *Instance) TryFlagValidated(conn *Connection, sid string, flags int64) (*Connection, error) {
+func (ins *Instance) TryFlagValidated(conn *Connection, sid string, flags int64) (*Connection, time.Duration, error) {
 	ins.mu.Lock()
 	defer ins.mu.Unlock()
 
 	if ins.IsClosed() {
 		// Validation is done by Close(), so we simply return here.
-		return conn, ErrInstanceClosed
+		return conn, 0, ErrInstanceClosed
 	}
 	// Identified unhandled cases:
 	// 1. Lambda is sleeping
@@ -1171,7 +1213,7 @@ func (ins *Instance) TryFlagValidated(conn *Connection, sid string, flags int64)
 	// Acknowledge data links
 	if !conn.control {
 		ins.lm.AddDataLink(conn)
-		return conn, ErrNotCtrlLink
+		return conn, 0, ErrNotCtrlLink
 	}
 
 	ins.log.Debug("[%v]Confirming validation...", ins)
@@ -1182,7 +1224,7 @@ func (ins *Instance) TryFlagValidated(conn *Connection, sid string, flags int64)
 	if conn != oldCtrl {
 		if !newSession && oldCtrl != nil && !conn.IsSameWorker(oldCtrl) {
 			// Deny session if session is duplicated and from another worker
-			return oldCtrl, ErrDuplicatedSession
+			return oldCtrl, 0, ErrDuplicatedSession
 		} else if newSession {
 			ins.log.Debug("Session %s started.", sid)
 		} else {
@@ -1213,7 +1255,7 @@ func (ins *Instance) TryFlagValidated(conn *Connection, sid string, flags int64)
 		} else if (flags&protocol.PONG_ON_INVOKING > 0) && ins.IsRecovering() {
 			// If flags indicate it is from function invocation without recovery request, the service is resumed but somehow we missed it.
 			ins.resumeServingLocked()
-			ins.log.Info("Function invoked without data loss, assuming parallel recovered and service resumed.")
+			ins.log.Debug("Function invoked without data loss, assuming parallel recovered and service resumed.")
 		}
 
 		if flags&protocol.PONG_RECLAIMED > 0 {
@@ -1223,26 +1265,26 @@ func (ins *Instance) TryFlagValidated(conn *Connection, sid string, flags int64)
 			ins.startDelegationLocked()
 			// We can close the instance if it is not backing any instance.
 			if !ins.IsBacking(true) {
-				ins.log.Info("Reclaimed")
-				validConn, _ := ins.flagValidatedLocked(conn, ErrInstanceReclaimed)
-				return validConn, nil
+				ins.log.Debug("Reclaimed")
+				validConn, due, _ := ins.flagValidatedLocked(conn, ErrInstanceReclaimed)
+				return validConn, due, nil
 			} else {
-				ins.log.Info("Reclaimed, keep running because the instance is backing another instance.")
+				ins.log.Debug("Reclaimed, keep running because the instance is backing another instance.")
 			}
 		}
 	}
 
-	validConn, _ := ins.flagValidatedLocked(conn)
+	validConn, due, _ := ins.flagValidatedLocked(conn)
 	if validConn != conn {
 		ins.log.Debug("[%v]Already validated", ins)
-		return validConn, ErrInstanceValidated
+		return validConn, due, ErrInstanceValidated
 	} else {
-		ins.SetDue(time.Now().Add(MinValidationInterval).UnixNano()) // Set MinValidationInterval
-		return validConn, nil
+		ins.SetDue(time.Now().Add(MinValidationInterval).UnixNano(), false, "keeping validation inteval") // Set due after MinValidationInterval immediately.
+		return validConn, due, nil
 	}
 }
 
-func (ins *Instance) flagValidatedLocked(conn *Connection, errs ...error) (*Connection, error) {
+func (ins *Instance) flagValidatedLocked(conn *Connection, errs ...error) (*Connection, time.Duration, error) {
 	var err error
 	if len(errs) > 0 {
 		err = errs[0]
@@ -1279,7 +1321,7 @@ func (ins *Instance) bye(conn *Connection) {
 	}
 
 	if atomic.CompareAndSwapUint32(&ins.awakeness, INSTANCE_MAYBE, INSTANCE_SLEEPING) {
-		ins.log.Info("[%v]Bye from unmanaged instance, flag as sleeping.", ins)
+		ins.log.Debug("[%v]Bye from unmanaged instance, flag as sleeping.", ins)
 	}
 	// } else {
 	// 	ins.log.Debug("[%v]Bye ignored, waiting for return of synchronous invocation.", ins)
@@ -1287,29 +1329,31 @@ func (ins *Instance) bye(conn *Connection) {
 }
 
 func (ins *Instance) handleRequest(cmd types.Command) {
-	if req := cmd.GetRequest(); req != nil && req.IsResponded() {
+	req := cmd.GetRequest()
+	if req != nil && !req.Validate(false) {
 		// Request is responded
+		ins.doneBusy(req)
 		return
 	} else if req != nil && req.Cmd == protocol.CMD_GET &&
 		ins.IsRecovering() && ins.rerouteGetRequest(req) {
 		// On parallel recovering, we will try reroute get requests.
+		ins.doneBusy(req)
 		return
 	}
-
-	// Set instance busy on request.
-	ins.busy(cmd)
-	defer ins.doneBusy(cmd)
 
 	leftAttempts, lastErr := cmd.LastError()
 	for leftAttempts > 0 {
 		if lastErr != nil {
-			ins.log.Info("Attempt %d: %v", types.MAX_ATTEMPTS-leftAttempts+1, cmd)
+			ins.log.Debug("Attempt %d: %v", types.MAX_ATTEMPTS-leftAttempts+1, cmd)
 		}
 		// Check lambda status first
 		validateStart := time.Now()
 		// Once active connection is confirmed, keep awake on serving.
-		ctrlLink, err := ins.Validate(&ValidateOption{Command: cmd})
+		ctrlLink, due, err := ins.Validate(&ValidateOption{Command: cmd})
 		validateDuration := time.Since(validateStart)
+		if req != nil {
+			req.PredictedDue = due
+		}
 
 		// Only after validated, we know whether the instance is reclaimed.
 		// If instance is expiring and reclaimed, we will relocate objects in main repository while backing objects are not affected.
@@ -1322,44 +1366,42 @@ func (ins *Instance) handleRequest(cmd types.Command) {
 		}
 
 		if reclaimPass {
+			ins.doneBusy(req)
+			// No more thing to do, the request will be handled by another instance.
 			return
 		} else if err != nil {
-			// Handle errors
-			if req, ok := cmd.(*types.Request); ok {
-				req.SetResponse(err)
-			}
-			return
+			lastErr = err
 		} else if ctrlLink == nil {
 			// Unexpected error
-			if req, ok := cmd.(*types.Request); ok {
-				req.SetResponse(ErrUnknown)
-			}
 			ins.log.Warn("Unexpected nil control link with no error returned.")
-			return
+			lastErr = ErrUnknown
+			break
+		} else {
+			ins.log.Debug("Ready to %v", cmd)
+
+			// Make request
+			lastErr = ins.request(ctrlLink, cmd, validateDuration)
 		}
 
-		ins.log.Debug("Ready to %v", cmd)
-
-		// Make request
-		lastErr = ins.request(ctrlLink, cmd, validateDuration)
-		leftAttempts = cmd.MarkError(err)
+		leftAttempts = cmd.MarkError(lastErr)
 		if lastErr == nil || leftAttempts == 0 { // Request can become streaming, so we need to test again everytime.
 			break
 		} else {
-			ins.ResetDue() // Force ping on error
-			ins.log.Warn("Failed to %v: %v", cmd, lastErr)
+			ins.ResetDue(false, "request failure") // Force ping on error
+			ins.log.Warn("Failed to %v: %v, %d attempts remaining.", cmd, lastErr, leftAttempts)
 		}
 	}
 	if lastErr != nil {
-		ins.ResetDue() // Force ping on error
+		ins.ResetDue(false, "request failure") // Force ping on error
 		if leftAttempts == 0 {
 			ins.log.Error("%v, give up: %v", cmd.FailureError(), lastErr)
 		} else {
 			ins.log.Error("Abandon retrial: %v", lastErr)
 		}
 		if request, ok := cmd.(*types.Request); ok {
-			request.SetResponse(lastErr)
+			request.SetErrorResponse(lastErr)
 		}
+		ins.doneBusy(req)
 	}
 
 	// Reset timer
@@ -1391,10 +1433,9 @@ func (ins *Instance) rerouteGetRequest(req *types.Request) bool {
 		return false
 	}
 
-	select {
-	case backup.chanPriorCmd <- req: // Rerouted request should not be queued again.
-	default:
-		ins.log.Info("We will not try to overload backup node, stop reroute %v", req)
+	// Rerouted request should not be queued again.
+	if !backup.shouldDispatch(req) {
+		ins.log.Debug("We will not try to overload backup node, stop reroute %v", req)
 		return false
 	}
 
@@ -1463,14 +1504,24 @@ func (ins *Instance) tryRerouteDelegateRequest(req *types.Request, opts int) boo
 	}
 }
 
+func (ins *Instance) retryPersist(persisted types.PersistChunk) {
+	req := persisted.Context().Value(types.CtxKeyRequest).(*types.Request)
+	if !persisted.IsStored() {
+		// Simply give up
+		ins.log.Warn("Retrying persisting chunk(%v) with no sufficient data, can failed to set.", &req.Id)
+		return
+	}
+
+	ins.log.Info("Retry persisting chunk(%v)...", &req.Id)
+	body, _ := persisted.LoadAll(context.Background()) // Use LoadAll to avoid hold a reference count.
+	ins.mustDispatch(req.ToSetRetrial(resp.NewInlineReader(body)))
+}
+
 func (ins *Instance) request(ctrlLink *Connection, cmd types.Command, validateDuration time.Duration) error {
 	cmdName := cmd.Name()
 	switch req := cmd.(type) {
 	case *types.Request:
 		collector.CollectRequest(collector.LogRequestValidation, req.CollectorEntry, int64(validateDuration))
-
-		// Select link
-		useDataLink := req.Size() > MaxControlRequestSize // Changes: will fallback to ctrl link.
 
 		// Record write operations
 		switch cmdName {
@@ -1482,7 +1533,7 @@ func (ins *Instance) request(ctrlLink *Connection, cmd types.Command, validateDu
 				ins.writtens.Store(req.Key, &struct{}{})
 			}
 		}
-		return ctrlLink.SendRequest(req, useDataLink, ins.lm) // Offer lm, so SendRequest is ctrl link free. (We still need to get ctrl link first to confirm lambda status.)
+		return ctrlLink.SendRequest(req, ins.shouldUseDataLink(req), ins.lm) // Offer lm, so SendRequest is ctrl link free. (We still need to get ctrl link first to confirm lambda status.)
 
 	case *types.Control:
 		isDataRequest := false
@@ -1552,20 +1603,74 @@ func (ins *Instance) resetCoolTimer(flag bool) {
 	}
 }
 
-func (ins *Instance) busy(cmd types.Command) {
-	if cmd.String() == protocol.CMD_SET {
-		atomic.AddInt32(&ins.numOutbound, 1)
+func (ins *Instance) isBusy(counter uint64, write bool) (uint64, bool) {
+	if write && ins.numBusyingWrites(counter) > IN_CONCURRENCY {
+		return counter, true
+	} else if ins.numBusying(counter) > MAX_CONCURRENCY {
+		return counter, true
 	} else {
-		atomic.AddInt32(&ins.numInbound, 1)
+		return counter, false
 	}
 }
 
-func (ins *Instance) doneBusy(cmd types.Command) {
-	if cmd.String() == protocol.CMD_SET {
-		atomic.AddInt32(&ins.numOutbound, -1)
-	} else {
-		atomic.AddInt32(&ins.numInbound, -1)
+func (ins *Instance) numBusying(counter uint64) uint64 {
+	return counter & NUM_REQUEST_MASK
+}
+
+func (ins *Instance) numBusyingWrites(counter uint64) uint64 {
+	return (counter & NUM_WRITE_REQUEST_MASK) >> NUM_WRITE_REQUEST_BITS
+}
+
+func (ins *Instance) setBusy(cmd types.Command) (uint64, bool) {
+	// Validate if the command is a request, control commands that wraps a request will be ignored.
+	req, _ := cmd.(*types.Request)
+	if req == nil {
+		return atomic.LoadUint64(&ins.numRequests), false
 	}
+
+	unit := ins.getBusyUnit(req)
+	counter, busy := ins.isBusy(atomic.AddUint64(&ins.numRequests, unit), unit > NUM_REQUEST_UNIT)
+	if busy {
+		// Rollback
+		counter = atomic.AddUint64(&ins.numRequests, ^(unit - 1))
+	} else {
+		// Restore the counter before added.
+		counter -= unit
+	}
+	return counter, busy
+}
+
+func (ins *Instance) addBusy(cmd types.Command) {
+	// Validate if the command is a request, control commands that wraps a request will be ignored.
+	req, _ := cmd.(*types.Request)
+	if req == nil {
+		return
+	}
+
+	atomic.AddUint64(&ins.numRequests, ins.getBusyUnit(req))
+}
+
+func (ins *Instance) doneBusy(cmd types.Command) {
+	// Validate if the command is a request, control commands that wraps a request will be ignored.
+	req, _ := cmd.(*types.Request)
+	if req == nil {
+		return
+	}
+
+	status := atomic.AddUint64(&ins.numRequests, ^(ins.getBusyUnit(req) - 1))
+	if ins.numBusying(status) == 0 || ins.delayedDue > ins.due {
+		ins.SetDue(ins.delayedDue, false, "concluding delayed due from %v", req)
+	} else {
+		ins.log.Info("Keep lambda due in %v for busy instance", time.Duration(ins.due-time.Now().UnixNano())) // Instance busy, keep the last due.
+	}
+}
+
+func (ins *Instance) getBusyUnit(req *types.Request) uint64 {
+	unit := uint64(NUM_REQUEST_UNIT)
+	if req.String() == protocol.CMD_SET {
+		unit += NUM_WRITE_REQUEST_UNIT
+	}
+	return unit
 }
 
 func (ins *Instance) CollectData() {
@@ -1586,12 +1691,25 @@ func (ins *Instance) FlagDataCollected(ok string) {
 	global.DataCollected.Done()
 }
 
-func (ins *Instance) SetDue(due int64) {
-	ins.due = due
+func (ins *Instance) SetDue(due int64, delay bool, reason string, args ...interface{}) {
+	ins.delayedDue = due
+	if !delay {
+		ins.due = due
+	}
+	if len(reason) == 0 {
+		return
+	}
+	timeout := time.Duration(due - time.Now().UnixNano())
+	if timeout <= -time.Millisecond {
+		ins.log.Warn("Set(%v) lambda due in %v for %s", delay, timeout, logger.NewFormatFunc(fmt.Sprintf, reason, args...))
+	} else {
+		ins.log.Debug("Set(%v) lambda due in %v for %s", delay, timeout, logger.NewFormatFunc(fmt.Sprintf, reason, args...))
+	}
 }
 
-func (ins *Instance) ResetDue() {
-	ins.due = time.Now().UnixNano()
+func (ins *Instance) ResetDue(delay bool, reason string) {
+	ins.log.Debug("Reset(%v) lambda due time for %s", delay, reason)
+	ins.SetDue(time.Now().UnixNano(), delay, "")
 }
 
 func (ins *Instance) getRerouteThreshold() uint64 {
@@ -1607,4 +1725,15 @@ func (ins *Instance) reconcileStatus(conn *Connection, meta *protocol.ShortMeta)
 		ins.Meta.Reconcile(meta)
 	}
 	ins.reconcilingWorker = conn.workerId // Track the worker that is reconciling.
+}
+
+func (ins *Instance) shouldUseDataLink(req *types.Request) bool {
+	// Always use data link for better performance.
+	return true
+	// // If WAIT_FOR_COS is enabled, SET must use data link.
+	// if req.Cmd == protocol.CMD_SET && global.LambdaFlags&protocol.FLAG_DISABLE_WAIT_FOR_COS == 0 {
+	// 	return true
+	// } else {
+	// 	return req.Size() > MaxControlRequestSize
+	// }
 }

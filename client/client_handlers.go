@@ -2,7 +2,6 @@ package client
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -14,13 +13,13 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/cespare/xxhash"
 	"github.com/google/uuid"
 	"github.com/mason-leap-lab/go-utils"
 	"github.com/mason-leap-lab/redeo/resp"
 	"github.com/sionreview/sion/common/logger"
 	"github.com/sionreview/sion/common/redeo/client"
 	protocol "github.com/sionreview/sion/common/types"
+	"github.com/sionreview/sion/common/util"
 )
 
 const (
@@ -32,9 +31,10 @@ var (
 	// ErrUnexpectedResponse Unexplected response
 	ErrUnexpectedResponse      = errors.New("unexpected response")
 	ErrUnexpectedPreflightPong = errors.New("unexpected preflight pong")
-	ErrMaxPreflightsReached    = errors.New("max preflight attemps reached")
+	ErrMaxPreflightsReached    = errors.New("max preflight attempts reached")
 	ErrAbandonRequest          = errors.New("abandon request")
 	ErrKeyNotFound             = errors.New("key not found")
+	ErrEmptyChunk              = errors.New("empty chunk")
 	ErrUnknown                 = errors.New("unknown error")
 	RequestAttempts            = 3
 
@@ -46,11 +46,8 @@ func init() {
 }
 
 type hasher struct {
+	util.Hasher
 	partitionCount uint64
-}
-
-func (h *hasher) Sum64(data []byte) uint64 {
-	return xxhash.Sum64(data)
 }
 
 func (h *hasher) PartitionID(key []byte) int {
@@ -122,7 +119,7 @@ func (c *Client) EcSet(key string, val []byte, args ...interface{}) (string, err
 		log.Warn("Failed to set %s,%s: %v", key, reqId, ErrUnknown)
 		return reqId, ErrClient
 	} else if ret.Err != nil {
-		log.Warn("Failed to set %s,%s: %v", key, reqId, ret.Err)
+		ret.PrintErrors("Failed to set %s,%s", key, reqId)
 		return reqId, ErrClient
 	}
 
@@ -144,7 +141,7 @@ func (c *Client) EcSet(key string, val []byte, args ...interface{}) (string, err
 // Internal error if the bool is set to false
 func (c *Client) Get(key string) (ReadAllCloser, bool) {
 	_, reader, err := c.EcGet(key, 0)
-	return reader, err != nil
+	return reader, err == nil
 }
 
 // EcGet Internal API
@@ -170,7 +167,7 @@ func (c *Client) EcGet(key string, args ...interface{}) (string, ReadAllCloser, 
 	reader, allRets := c.get(host, key, reqId)
 	ret := allRets[0]
 	if ret.Err != nil {
-		log.Warn("Failed to get %s,%s: %v", key, reqId, ret.Err)
+		ret.PrintErrors("Failed to get %s,%s", key, reqId)
 		return reqId, nil, utils.Ifelse(ret.Err == ErrNotFound, ret.Err, ErrClient).(error)
 	}
 
@@ -319,18 +316,20 @@ func (c *Client) sendSet(addr string, key string, reqId string, size string, i i
 	req.Cmd = protocol.CMD_SET_CHUNK
 	req.ReqId = reqId
 
-	for attemp := 0; attemp < RequestAttempts; attemp++ {
-		if attemp > 0 {
-			log.Info("Retry setting %d@%s(%s), %s, attempt %d", i, key, addr, reqId, attemp+1)
+	var lastErr error
+	for attempt := 0; attempt < RequestAttempts; attempt++ {
+		if attempt > 0 {
+			log.Info("Retry setting %d@%s(%s), %s, attempt %d", i, key, addr, reqId, attempt+1)
 		}
 
 		cn, err := c.validate(addr, i)
 		if err != nil {
-			req.SetResponse(err)
-			log.Warn("Failed to validate connection %d@%s(%s): %v", i, key, addr, err)
+			req.SetResponse(fmt.Errorf("error on validating connection(%s): %v", addr, err), "sendSet")
 			return
 		}
 
+		req.SetConn(cn)
+		var errPrompts string
 		err = cn.StartRequest(req, func(_ client.Request) error {
 			cn.SetWriteDeadline(time.Now().Add(HeaderTimeout)) // Set deadline for request
 			defer cn.SetWriteDeadline(time.Time{})             // One defered reset is enough.
@@ -347,7 +346,7 @@ func (c *Client) sendSet(addr string, key string, reqId string, size string, i i
 			cn.WriteBulkString(strconv.Itoa(lambdaId))
 			cn.WriteBulkString(strconv.Itoa(MaxLambdaStores))
 			if err := cn.Flush(); err != nil {
-				log.Warn("Failed to flush headers of setting %d@%s(%s): %v", i, key, addr, err)
+				errPrompts = "Failed to flush headers of setting %d@%s(%v): %v, left attempts: %d"
 				return err
 			}
 
@@ -355,27 +354,32 @@ func (c *Client) sendSet(addr string, key string, reqId string, size string, i i
 			//if err := c.W[i].Flush(); err != nil {
 			cn.SetWriteDeadline(time.Now().Add(Timeout))
 			if err := cn.CopyBulk(bytes.NewReader(val), int64(len(val))); err != nil {
-				log.Warn("Failed to stream body of setting %d@%s(%s): %v", i, key, addr, err)
+				errPrompts = "Failed to stream body of setting %d@%s(%v): %v, left attempts: %d"
 				return err
 			}
 			return nil
 		})
 		if err != nil && c.closed {
-			req.SetResponse(ErrClientClosed)
+			req.SetResponse(ErrClientClosed, "sendSet")
 			return
 		} else if err != nil {
+			lastErr = err
+			if len(errPrompts) > 0 {
+				log.Warn(errPrompts, i, key, cn.GetConn(), err, RequestAttempts-attempt-1)
+			} else {
+				log.Warn("Failed to initiate setting %d@%s(%v): %v, left attempts: %d", i, key, cn.GetConn(), err, RequestAttempts-attempt-1)
+			}
+
 			continue
 		}
 
-		log.Debug("Initiated setting %d@%s(%s), attempt %d", i, key, addr, attemp+1)
-		ctx, cancel := context.WithTimeout(req.Context(), Timeout)
-		req.Cancel = cancel
-		req.SetContext(ctx)
+		log.Debug("Initiated setting %d@%s(%s), attempt %d", i, key, addr, attempt+1)
+		// Set deadline for response header.
+		cn.SetReadDeadline(time.Now().Add(Timeout))
 		return
 	}
 
-	log.Warn("Stop attempts to set %s(%d): %v", reqId, i, ErrMaxPreflightsReached)
-	req.SetResponse(ErrMaxPreflightsReached)
+	req.SetResponse(fmt.Errorf("stop attempts: %v, last error: %v", ErrMaxPreflightsReached, lastErr), "sendSet")
 }
 
 func (c *Client) readSetResponse(req *ClientRequest) error {
@@ -391,10 +395,10 @@ func (c *Client) readSetResponse(req *ClientRequest) error {
 	cn.SetReadDeadline(time.Now().Add(HeaderTimeout))
 	appErr, err := c.readErrorResponse(req)
 	if err != nil {
-		req.SetResponse(err)
+		req.SetResponse(err, "readSetResponse")
 		return err
 	} else if appErr != nil {
-		req.SetResponse(appErr)
+		req.SetResponse(appErr, "readSetResponse")
 		return nil
 	}
 
@@ -402,20 +406,19 @@ func (c *Client) readSetResponse(req *ClientRequest) error {
 	chunkId, _ := cn.ReadBulkString()
 	storeId, err := cn.ReadBulkString()
 	if err != nil {
-		log.Warn("Error on reading header of get %s(%d): %v", req.ReqId, cm.AddrIdx, err)
-		req.SetResponse(err)
+		req.SetResponse(fmt.Errorf("error on reading header: %v", err), "readSetResponse")
 		return err
 	}
 
 	// Match reqId and chunk
 	if respId != req.ReqId || chunkId != strconv.Itoa(cm.AddrIdx) {
 		log.Warn("Unexpected response %s(%s), expects %s(%d)", logger.SafeString(respId, len(req.ReqId)), logger.SafeString(chunkId, 2), req.ReqId, cm.AddrIdx)
-		req.SetResponse(ErrUnexpectedResponse)
+		req.SetResponse(ErrUnexpectedResponse, "readSetResponse")
 		return nil
 	}
 
 	log.Debug("Set chunk %s(%d)", req.ReqId, cm.AddrIdx)
-	req.SetResponse(storeId)
+	req.SetResponse(storeId, "readSetResponse")
 	return nil
 }
 
@@ -432,8 +435,10 @@ func (c *Client) get(host string, key string, reqId string) (ReadAllCloser, []*e
 	}
 	ret.Wait()
 
-	if ret.Err != nil {
+	if ret.Err != nil && ret.NumOK() < c.DataShards {
 		return nil, []*ecRet{ret}
+	} else {
+		ret.Err = nil
 	}
 
 	var err error
@@ -466,6 +471,7 @@ func (c *Client) get(host string, key string, reqId string) (ReadAllCloser, []*e
 		// Continue to process multi-part(large) object.
 	}
 
+	// For multi-part object, we need to read all fragments and merge them.
 	allRets := make([]*ecRet, ret.Meta.NumFrags)
 	allRets[0] = ret
 	for i := 1; i < len(allRets); i++ {
@@ -539,10 +545,22 @@ func (c *Client) decodeFragment(ret *ecRet, size int) (ReadAllCloser, error) {
 		return nil, ret.Err
 	}
 
-	// Filter results
+	// Filter results, either reading all shards or up to the number of data shards, or data reconstruction will fail.
+	// e.g. if we have 4 data shards and 2 parity shards, following are valid cases:
+	// 1. 4 shards
+	// 2. 6 shards
+	// Unexpectedly, 5 shards will fail.
 	chunks := make([][]byte, ret.Len())
-	for i := 0; i < ret.Len(); i++ {
+	tbRead := ret.NumOK()
+	if tbRead < c.DataShards+c.ParityShards {
+		tbRead = c.DataShards
+	}
+	read := 0
+	for i := 0; i < ret.Len() && read < tbRead; i++ {
 		chunks[i] = ret.RetChunk(i)
+		if len(chunks[i]) > 0 {
+			read++
+		}
 	}
 
 	decodeStart := time.Now()
@@ -561,27 +579,44 @@ func (c *Client) sendGet(addr string, key string, reqId string, i int, ret *ecRe
 	req.Cmd = protocol.CMD_GET_CHUNK
 	req.ReqId = reqId
 
-	cn, err := c.validate(addr, i)
-	if err != nil {
-		req.SetResponse(err)
-		log.Warn("Failed to validate connection %d@%s(%s): %v", i, key, addr, err)
+	var lastErr error
+	for attempt := 0; attempt < RequestAttempts; attempt++ {
+		if attempt > 0 {
+			log.Info("Retry getting %d@%s(%s), %s, attempt %d", i, key, addr, reqId, attempt+1)
+		}
+
+		cn, err := c.validate(addr, i)
+		if err != nil {
+			req.SetResponse(fmt.Errorf("error on validating connection(%s): %v", addr, err), "sendGet")
+			return
+		}
+
+		req.SetConn(cn)
+		err = cn.StartRequest(req, func(_ client.Request) error {
+			// cmd seq key reqId chunkId
+			cn.WriteCmdString(req.Cmd, strconv.FormatInt(req.Seq(), 10), key, req.ReqId, strconv.Itoa(i))
+			return nil
+		})
+		// if err != nil && err == client.ErrResponded {
+		// 	// Already responded, may be first-d abandoned.
+		// 	return
+		// } else
+		if err != nil && c.closed {
+			req.SetResponse(ErrClientClosed, "sendGet")
+			return
+		} else if err != nil {
+			lastErr = err
+			log.Warn("Failed to initiate getting %d@%s(%v): %v, left attempts: %d", i, key, cn.GetConn(), err, RequestAttempts-attempt-1)
+			continue
+		}
+
+		log.Debug("Initiated getting %d@%s(%s), attempt %d", i, key, addr, attempt+1)
+		// Set deadline for response header.
+		cn.SetReadDeadline(time.Now().Add(Timeout))
 		return
 	}
 
-	err = cn.StartRequest(req, func(_ client.Request) error {
-		// cmd seq key reqId chunkId
-		cn.WriteCmdString(req.Cmd, strconv.FormatInt(req.Seq(), 10), key, req.ReqId, strconv.Itoa(i))
-		return nil
-	})
-	if err != nil {
-		log.Warn("Failed to initiate getting %d@%s(%s): %v", i, key, addr, err)
-		return
-	}
-	ctx, cancel := context.WithTimeout(req.Context(), Timeout)
-	req.Cancel = cancel
-	req.SetContext(ctx)
-
-	log.Debug("Initiated getting %d@%s(%s) %d", i, key, addr, req.Seq())
+	req.SetResponse(fmt.Errorf("stop attempts: %v, last error %v", ErrMaxPreflightsReached, lastErr), "sendGet")
 }
 
 func (c *Client) readGetResponse(req *ClientRequest) error {
@@ -592,10 +627,10 @@ func (c *Client) readGetResponse(req *ClientRequest) error {
 	cn.SetReadDeadline(time.Now().Add(HeaderTimeout))
 	appErr, err := c.readErrorResponse(req)
 	if err != nil {
-		req.SetResponse(err)
+		req.SetResponse(err, "readGetResponse")
 		return err
 	} else if appErr != nil {
-		req.SetResponse(appErr)
+		req.SetResponse(appErr, "readGetResponse")
 		return nil
 	}
 
@@ -603,15 +638,15 @@ func (c *Client) readGetResponse(req *ClientRequest) error {
 	meta, _ := cn.ReadBulkString()
 	chunkId, err := cn.ReadBulkString()
 	if err != nil {
-		log.Warn("Error on reading header of get %s(%d): %v", req.ReqId, cm.AddrIdx, err)
-		req.SetResponse(err)
+		req.SetResponse(fmt.Errorf("error on reading header: %v", err), "readGetResponse")
+		// Could acceptable for client first-D optimization.
 		return err
 	}
 
 	// Matching chunk
 	if respId != req.ReqId || (chunkId != strconv.Itoa(cm.AddrIdx) && chunkId != "-1") {
 		log.Warn("Unexpected response %s(%s), expects %s(%d)", logger.SafeString(respId, len(req.ReqId)), logger.SafeString(chunkId, 2), req.ReqId, cm.AddrIdx)
-		req.SetResponse(ErrUnexpectedResponse)
+		req.SetResponse(ErrUnexpectedResponse, "readGetResponse")
 		// Skip body
 		if err := cn.SkipBulk(); err != nil {
 			return err
@@ -622,8 +657,7 @@ func (c *Client) readGetResponse(req *ClientRequest) error {
 
 	// Abandon?
 	if chunkId == "-1" {
-		log.Debug("Abandon late chunk %s(%d)", req.ReqId, cm.AddrIdx)
-		req.SetResponse(nil)
+		req.SetResponse(ErrAbandon, "readGetResponse")
 		return nil
 	}
 
@@ -631,18 +665,18 @@ func (c *Client) readGetResponse(req *ClientRequest) error {
 	cn.SetReadDeadline(time.Now().Add(Timeout))
 	valReader, err := cn.StreamBulk()
 	if err != nil {
-		log.Warn("Error on getting reader of received chunk %s(%d): %v", req.ReqId, cm.AddrIdx, err)
-		req.SetResponse(err)
+		req.SetResponse(fmt.Errorf("error on getting reader of received chunk: %v", err), "readGetResponse")
 		return err
 	}
 	if valReader.Len() == 0 {
-		log.Warn("Got empty chunk %s(%d)", req.ReqId, cm.AddrIdx)
+		req.SetResponse(fmt.Errorf("got empty chunk"), "readGetResponse")
+		valReader.ReadAll()
+		return ErrEmptyChunk
 	}
 
 	val, err := valReader.ReadAll()
 	if err != nil {
-		log.Warn("Error on streaming received chunk %s(%d): %v", req.ReqId, cm.AddrIdx, err)
-		req.SetResponse(err)
+		req.SetResponse(fmt.Errorf("error on streaming received chunk: %v", err), "readGetResponse")
 		return err
 	}
 
@@ -652,7 +686,7 @@ func (c *Client) readGetResponse(req *ClientRequest) error {
 	}
 
 	log.Debug("Got chunk %s(%d)", req.ReqId, cm.AddrIdx)
-	req.SetResponse(val)
+	req.SetResponse(val, "readGetResponse")
 	return nil
 }
 
@@ -706,15 +740,16 @@ func (c *Client) decode(stats *logEntry, data [][]byte, size int) (ReadAllCloser
 		// 	return nil, err
 	} else {
 		log.Debug("Verification failed. Reconstructing data...")
-		err := c.EC.Reconstruct(data)
-		if err != nil {
+		if err := c.EC.Reconstruct(data); err != nil {
 			// log.Warn("Reconstruction failed: %v", err)
 			return nil, err
 		}
-		stats.Corrupted, err = c.EC.Verify(data)
-		if !stats.Corrupted {
-			// log.Warn("Verification failed after reconstruction, data could be corrupted: %v", err)
+		if good, err := c.EC.Verify(data); err != nil {
 			return nil, err
+		} else if !good {
+			// log.Warn("Verification failed after reconstruction, data could be corrupted: %v", err)
+			stats.Corrupted = true
+			return nil, ErrCorrupted
 		}
 
 		log.Debug("Reconstructed")

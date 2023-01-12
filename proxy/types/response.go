@@ -4,43 +4,91 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"sync"
 
+	"github.com/mason-leap-lab/redeo"
 	"github.com/mason-leap-lab/redeo/resp"
+	protocol "github.com/sionreview/sion/common/types"
+	"github.com/sionreview/sion/common/util"
 )
 
-type ProxyResponse struct {
-	Response interface{}
-	Request  *Request
+type ResponseFinalizer func(*Response)
 
-	ctx context.Context
+type ProxyResponse interface {
+	redeo.Contextable
+	Request() *Request
+	Response() interface{}
+}
+
+type proxyResponse struct {
+	protocol.Contextable
+	response interface{}
+	request  *Request
 }
 
 // Context return the response context
-func (r *ProxyResponse) Context() context.Context {
-	if r.ctx != nil {
-		return r.ctx
-	}
-	return context.Background()
+func (r *proxyResponse) Response() interface{} {
+	return r.response
 }
 
 // SetContext sets the client's context
-func (r *ProxyResponse) SetContext(ctx context.Context) {
-	r.ctx = ctx
+func (r *proxyResponse) Request() *Request {
+	return r.request
 }
 
 type Response struct {
+	util.Closer
+	protocol.Contextable
+
 	Id         Id
 	Cmd        string
 	Size       string
 	Body       []byte
-	BodyStream resp.AllReadCloser
-	Status     int64
+	bodyStream resp.AllReadCloser
+	stream     resp.AllReadCloser // A copy of bodyStream, used for draining even after the response has been abandoned.
+	Status     int64              // Customized status. For GET: 1 - recovered
 
-	w resp.ResponseWriter
+	request   *Request
+	finalizer ResponseFinalizer
+	abandon   bool                    // Abandon flag, set in Request class.
+	cached    PersistChunkForResponse // Cached flag, the response is served from cache.
+
+	w         resp.ResponseWriter
+	ctxCancel context.CancelFunc
+	ctxDone   <-chan struct{} // There is bug to laziliy call the ctx.Done() in highly parallelized settings. Initiate and cache the done channel to avoid the bug.
+	ctxError  error           // Keep the error to avoid calling the ctx.Err() in highly parallelized settings.
+	connError error           // Keep the error to be used in WaitFlush.
+	from      string
+	mu        sync.Mutex
+}
+
+func NewResponse(cmd string) *Response {
+	rsp := &Response{Cmd: cmd}
+	rsp.Closer.Init()
+	rsp.from = "responded"
+	return rsp
+}
+
+func (rsp *Response) Response() interface{} {
+	return rsp
+}
+
+func (rsp *Response) Request() *Request {
+	return rsp.request
 }
 
 func (rsp *Response) String() string {
-	return fmt.Sprintf("%s %v", rsp.Cmd, rsp.Id)
+	return fmt.Sprintf("%s %s:%v", rsp.from, rsp.Cmd, &rsp.Id)
+}
+
+func (rsp *Response) SetBodyStream(stream resp.AllReadCloser) {
+	var ctx context.Context
+	ctx, rsp.ctxCancel = context.WithCancel(rsp.Context())
+	rsp.ctxDone = ctx.Done() // There is bug to laziliy call the ctx.Done() in highly parallelized settings. Initiate and cache the done channel to avoid the bug.
+	rsp.SetContext(ctx)
+	rsp.bodyStream = stream
+	rsp.stream = stream
 }
 
 func (rsp *Response) PrepareForSet(w resp.ResponseWriter, seq int64) {
@@ -52,16 +100,31 @@ func (rsp *Response) PrepareForSet(w resp.ResponseWriter, seq int64) {
 }
 
 func (rsp *Response) PrepareForGet(w resp.ResponseWriter, seq int64) {
+	// Exclusive block with cancel handling in WaitFlush
+	rsp.mu.Lock()
+	defer rsp.mu.Unlock()
+
 	w.AppendInt(seq)
 	w.AppendBulkString(rsp.Id.ReqId)
 	w.AppendBulkString(rsp.Size)
-	if rsp.Body == nil && rsp.BodyStream == nil {
+	if rsp.Body == nil && rsp.bodyStream == nil {
 		w.AppendBulkString("-1")
+	} else if rsp.getCtxError() != nil { // Here is a good place to test the ctxCancellation again if the rsp was ctxCancelled before the client is available.
+		// Cancelled request is treated as abandon.
+		w.AppendBulkString("-1")
+		rsp.abandon = true
+		// Clear body and bodyStream. Note that the stream is still available to use.
+		rsp.Body = nil
+		rsp.bodyStream = nil
+		// Unhold the stream, so the Close() can consume the stream.
+		if holdable, ok := rsp.stream.(resp.Holdable); ok {
+			holdable.Unhold()
+		}
 	} else {
 		w.AppendBulkString(rsp.Id.ChunkId)
 	}
 	// Only one body field is returned, stream is prefered.
-	if rsp.BodyStream == nil && rsp.Body != nil {
+	if rsp.bodyStream == nil && rsp.Body != nil {
 		w.AppendBulk(rsp.Body)
 	}
 	rsp.w = w
@@ -74,15 +137,155 @@ func (rsp *Response) Flush() error {
 	w := rsp.w
 	rsp.w = nil
 
-	if rsp.BodyStream != nil {
-		if err := w.CopyBulk(rsp.BodyStream, rsp.BodyStream.Len()); err != nil {
+	if rsp.bodyStream != nil {
+		if err := w.CopyBulk(rsp.bodyStream, rsp.bodyStream.Len()); err != nil {
+			// Save the error to be used in WaitFlush.
+			rsp.connError = err
 			// On error, we need to unhold the stream, and allow Close to perform.
-			if holdable, ok := rsp.BodyStream.(resp.Holdable); ok {
+			if holdable, ok := rsp.bodyStream.(resp.Holdable); ok {
 				holdable.Unhold()
 			}
-			return err
+			// If error is cause by the CancelFlush, override the return error.
+			if rsp.getCtxError() != nil {
+				return rsp.getCtxError()
+			} else {
+				return err
+			}
 		}
 	}
 
-	return w.Flush()
+	// Override the error if the response is abandoned and err occurred.
+	err := w.Flush()
+	if err != nil {
+		rsp.connError = err
+		if rsp.getCtxError() != nil {
+			err = rsp.getCtxError()
+		}
+	}
+	return err
+}
+
+func (rsp *Response) IsAbandon() bool {
+	return rsp.abandon
+}
+
+func (rsp *Response) IsCached() (stored int64, full bool, cached bool) {
+	if rsp.cached == nil {
+		return 0, false, false
+	}
+	return rsp.cached.BytesStored(), rsp.cached.IsStored(), true
+}
+
+// WaitFlush will wait for the response stream to be flushed. Non-stream transmission will return immediately. It returns:
+// 1. context.Cancel if the flush is canceled.
+// 2. transmission error if the flush was failed.
+// Read error after canceled will be ignored.
+func (rsp *Response) WaitFlush(ctxCancelable bool) error {
+	return rsp.waitFlush(ctxCancelable, rsp.getClientConn)
+}
+
+func (rsp *Response) waitFlush(ctxCancelable bool, getConn func() net.Conn) error {
+	stream := rsp.stream // The stream will always be available after set.
+	if stream != nil {
+		if !ctxCancelable {
+			return stream.Close()
+		}
+
+		// Allow the wait be ctxCanceled.
+		chWait := make(chan error)
+		go func() {
+			chWait <- stream.Close()
+		}()
+		defer rsp.CancelFlush()
+
+		select {
+		case <-chWait: // No need to store generated error, for it will be identical to the one generated during CopyBulk()
+			return rsp.connError
+			// break
+		case <-rsp.ctxDone:
+			rsp.abandon = true
+			rsp.ctxError = context.Canceled // Only cancel is supported, we avoid reading err from context to reduce lock overhead.
+
+			// Exclusive block with cancel handling in PrepareForGet
+			rsp.mu.Lock()
+			if rsp.bodyStream == nil {
+				rsp.mu.Unlock()
+				// bodyStream cleared and no stream will be sent to client.
+				rsp.OnFinalize(func(_ *Response) {
+					// Register finalizer to wait for the close of the stream.
+					<-chWait
+				})
+				return context.Canceled
+			}
+			rsp.mu.Unlock()
+
+			// Try preempt transimission.
+			// If the stream is served by Lambda, we disconnect the client and wait for stream consumed to reuse limited Lambda connections.
+			if stored, _, cached := rsp.IsCached(); !cached {
+				// Disconnect the client if it's available.
+				conn := getConn()
+				if conn != nil {
+					util.CloseWithReason(conn, "closedAbandon")
+				} // else test ctxCancellation after client is available.
+
+				// Register finalizer to wait for the close of the stream.
+				rsp.OnFinalize(func(_ *Response) {
+					<-chWait
+				})
+			} else if stored > 0 {
+				// Once the cahced starts accepting data, it is unlikely to interrupt. We will then not do abandon the stream for good throughput.
+				return <-chWait
+			}
+			// If the stream is served from cache and waiting for data, we simply do nothing. Cached stream will be canceled automatically in proxy.waitForCache()
+			return context.Canceled // Hard code the error to avoid locking.
+		}
+	}
+	return nil
+}
+
+func (rsp *Response) CancelFlush() {
+	if rsp.ctxCancel != nil {
+		rsp.ctxError = context.Canceled
+		rsp.ctxCancel()
+	}
+}
+
+func (rsp *Response) OnFinalize(finalizer ResponseFinalizer) {
+	if rsp.finalizer != nil {
+		finalizer = func(oldFinalizer ResponseFinalizer, newFinalizer ResponseFinalizer) ResponseFinalizer {
+			return func(rsp *Response) {
+				newFinalizer(rsp)
+				oldFinalizer(rsp)
+			}
+		}(rsp.finalizer, finalizer)
+	}
+	rsp.finalizer = finalizer
+}
+
+func (rsp *Response) Close() {
+	if rsp.finalizer != nil {
+		rsp.finalizer(rsp)
+		rsp.finalizer = nil
+	}
+
+	rsp.Closer.Close()
+}
+
+// Close will block and wait for the stream to be flushed.
+// Don't clean any fields if it can't be blocked until flushed.
+func (rsp *Response) Wait() {
+	rsp.Closer.Wait()
+}
+
+func (rsp *Response) getClientConn() net.Conn {
+	client := redeo.GetClient(rsp.Context())
+	if client != nil {
+		return client.Conn()
+	}
+	return nil
+}
+
+// Change implementation if needed.
+func (rsp *Response) getCtxError() error {
+	return rsp.ctxError
 }

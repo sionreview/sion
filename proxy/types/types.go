@@ -6,8 +6,8 @@ import (
 	"net"
 	"strconv"
 
+	"github.com/mason-leap-lab/go-utils/promise"
 	"github.com/mason-leap-lab/redeo/resp"
-	"github.com/sionreview/sion/common/util/promise"
 )
 
 var ErrNoSpareDeployment = errors.New("no spare deployment")
@@ -50,7 +50,7 @@ func (id *Id) Chunk() int {
 	return id.chunk
 }
 
-func (id Id) String() string {
+func (id *Id) String() string {
 	return fmt.Sprintf("%s(%s)", id.ReqId, id.ChunkId)
 }
 
@@ -81,6 +81,10 @@ type LambdaDeployment interface {
 type MigrationScheduler interface {
 	StartMigrator(uint64) (string, error)
 	GetDestination(uint64) (LambdaDeployment, error)
+}
+
+type ServerStats interface {
+	PersistCacheLen() int
 }
 
 type MetaStoreStats interface {

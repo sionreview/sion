@@ -27,17 +27,18 @@ type InstanceManager interface {
 
 type Placer interface {
 	// Parameters: key, size, dChunks, pChunks, chunkId, chunkSize, lambdaId, sliceSize
-	NewMeta(string, string, int, int, int, int64, uint64, int) *Meta
-	InsertAndPlace(string, *Meta, types.Command) (*Meta, MetaPostProcess, error)
-	Place(*Meta, int, types.Command) (*lambdastore.Instance, MetaPostProcess, error)
+	NewMeta(string, string, int64, int, int, int, int64, uint64, int) *Meta
+	InsertAndPlace(key string, prepared *Meta, req types.Command) (meta *Meta, postProcess MetaPostProcess, err error)
+	Place(meta *Meta, chunkId int, req types.Command) (ins *lambdastore.Instance, postProcess MetaPostProcess, err error)
 	Get(string, int) (*Meta, bool)
+	GetByVersion(string, int, int) (*Meta, bool)
 	Dispatch(*lambdastore.Instance, types.Command) error
 	MetaStats() types.MetaStoreStats
+	RegisterHandler(event PlacerEvent, handler PlacerHandler)
 }
 
-type MetaInitializer func(meta *Meta)
-
 type DefaultPlacer struct {
+	*PlacerEvents
 	metaStore *MetaStore
 	cluster   InstanceManager
 	log       logger.ILogger
@@ -45,15 +46,16 @@ type DefaultPlacer struct {
 
 func NewDefaultPlacer(store *MetaStore, cluster InstanceManager) *DefaultPlacer {
 	placer := &DefaultPlacer{
-		metaStore: store,
-		cluster:   cluster,
-		log:       global.GetLogger("DefaultPlacer: "),
+		PlacerEvents: newPlacerEvents(),
+		metaStore:    store,
+		cluster:      cluster,
+		log:          global.GetLogger("DefaultPlacer: "),
 	}
 	return placer
 }
 
-func (l *DefaultPlacer) NewMeta(key string, size string, dChunks, pChunks, chunkId int, chunkSize int64, lambdaId uint64, sliceSize int) *Meta {
-	meta := NewMeta(key, size, dChunks, pChunks, chunkSize)
+func (l *DefaultPlacer) NewMeta(reqId string, key string, size int64, dChunks, pChunks, chunkId int, chunkSize int64, lambdaId uint64, sliceSize int) *Meta {
+	meta := NewMeta(reqId, key, size, dChunks, pChunks, chunkSize)
 	meta.Placement[chunkId] = lambdaId
 	meta.lastChunk = chunkId
 	return meta
@@ -62,11 +64,19 @@ func (l *DefaultPlacer) NewMeta(key string, size string, dChunks, pChunks, chunk
 func (l *DefaultPlacer) InsertAndPlace(key string, newMeta *Meta, cmd types.Command) (*Meta, MetaPostProcess, error) {
 	chunkId := newMeta.lastChunk
 
-	meta, got, _ := l.metaStore.GetOrInsert(key, newMeta)
+	meta, got, err := l.metaStore.GetOrInsert(key, newMeta)
+	if err != nil {
+		newMeta.close()
+		return meta, nil, err
+	}
 	if got {
 		newMeta.close()
 	}
+	cmd.GetRequest().Key = meta.ChunkKey(chunkId)
 	cmd.GetRequest().Info = meta
+
+	// Trigger before placing event.
+	l.beforePlacing(meta, chunkId, cmd)
 
 	instance, post, err := l.Place(meta, chunkId, cmd)
 	if err != nil {
@@ -86,6 +96,16 @@ func (l *DefaultPlacer) Get(key string, chunk int) (*Meta, bool) {
 
 	// TODO: Do some statistic
 
+	return meta, ok
+}
+
+func (l *DefaultPlacer) GetByVersion(key string, ver int, chunk int) (*Meta, bool) {
+	meta, ok := l.metaStore.GetByVersion(key, ver)
+	if !ok {
+		return nil, ok
+	}
+
+	// TODO: Do some statistic
 	return meta, ok
 }
 
@@ -120,9 +140,6 @@ func (l *DefaultPlacer) Place(meta *Meta, chunkId int, cmd types.Command) (*lamb
 			}
 			// Try next group
 			test += len(meta.Placement)
-		} else if ins.IsBusy(cmd) {
-			// Try next group
-			test += len(meta.Placement)
 		} else if err := ins.DispatchWithOptions(cmd, lambdastore.DISPATCH_OPT_BUSY_CHECK); err == lambdastore.ErrInstanceBusy {
 			// Try next group
 			test += len(meta.Placement)
@@ -148,11 +165,7 @@ func (l *DefaultPlacer) Place(meta *Meta, chunkId int, cmd types.Command) (*lamb
 }
 
 func (l *DefaultPlacer) Dispatch(ins *lambdastore.Instance, cmd types.Command) (err error) {
-	if ins.IsBusy(cmd) {
-		err = lambdastore.ErrInstanceBusy
-	} else {
-		err = ins.DispatchWithOptions(cmd, lambdastore.DISPATCH_OPT_BUSY_CHECK)
-	}
+	err = ins.DispatchWithOptions(cmd, lambdastore.DISPATCH_OPT_BUSY_CHECK)
 	if err == nil || err != lambdastore.ErrInstanceBusy {
 		return err
 	}
@@ -183,9 +196,6 @@ func (l *DefaultPlacer) Dispatch(ins *lambdastore.Instance, cmd types.Command) (
 		cmd.GetRequest().InsId = ins.Id()
 		if l.testChunk(ins, uint64(meta.ChunkSize)) {
 			// Sizing check failed, try next group
-			test += len(meta.Placement)
-		} else if ins.IsBusy(cmd) {
-			// Try next group
 			test += len(meta.Placement)
 		} else if err := ins.DispatchWithOptions(cmd, lambdastore.DISPATCH_OPT_BUSY_CHECK|lambdastore.DISPATCH_OPT_RELOCATED); err == lambdastore.ErrInstanceBusy || lambdastore.IsLambdaTimeout(err) {
 			// Try next group

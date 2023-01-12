@@ -12,7 +12,7 @@ build-local: build
 	go build -o bin/lambda ../lambda/
 
 build-data: prepare
-	go build -o bin/preprocess benchmark-recovery/preprocess.go
+	go build -o bin/preprocess preprocess/preprocess.go
 
 build-bench: prepare
 	GO111MODULE=off go build -o bin/sionreplayer github.com/sionreview/sionreplayer/
@@ -27,25 +27,40 @@ dryrun: build build-simulator
 	./playback.sh dryrun /trace/docker_traces/data_centers/csv/dal09_blobs_50h.csv 400 "-d=10 -p=2 -w=100 -balance"
 
 simulate: build build-simulator
-	./playback.sh /trace/docker_traces/data_centers/csv/dal09_10mb_8h.csv 1000 "" "-d=10 -p=2" -compact 1>./log 2>&1 &
+	./playback.sh playback /trace/docker_traces/data_centers/csv/dal09_10mb_8h.csv 1000 "" "-d=10 -p=2" -compact 1>./log 2>&1 &
 
 simulate-with-dashboard: build build-simulator
-	./playback.sh /trace/docker_traces/data_centers/csv/dal09_10mb_8h.csv 1000 "" "-d=10 -p=2" -compact -enable-dashboard 1>./log 2>&1 &
+	./playback.sh playback /trace/docker_traces/data_centers/csv/dal09_10mb_8h.csv 1000 "" "-d=10 -p=2" -compact -enable-dashboard 1>./log 2>&1 &
 
 playback: build build-simulator
-	./playback.sh /trace/docker_traces/data_centers/csv/dal09_blobs_50h.csv 1000 "" "-d=10 -p=2" 1>./log 2>&1 &
+	./playback.sh playback /trace/docker_traces/data_centers/csv/dal09_blobs_50h.csv 1000 "" "-d=10 -p=2" 1>./log 2>&1 &
 
 playback-with-dashboard: build build-simulator
-	./playback.sh /trace/docker_traces/data_centers/csv/dal09_blobs_50h.csv 1000 "" "-d=10 -p=2" -enable-dashboard 1>./log 2>&1 &
+	./playback.sh playback /trace/docker_traces/data_centers/csv/dal09_blobs_50h.csv 1000 "" "-d=10 -p=2" -enable-dashboard 1>./log 2>&1 &
+
+playback-accelerated: build build-simulator
+	./playback.sh playback /trace/docker_traces/data_centers/csv/dal09_blobs_50h.csv 1000 "" "-d=10 -p=2 -speed=10" -enable-dashboard 1>./log 2>&1 &
+
+playback-redis: build-simulator
+	bin/playback -d 1 -p 0 -redis "redis-%04d-001.fxxiur.0001.use1.cache.amazonaws.com:6379" -redisCluster 12 -file ./data/$(DATE)_redis /trace/docker_traces/data_centers/csv/dal09_blobs_50h.csv 1>./data/$(DATE).log 2>&1 &
+	@echo "show log: tail -f ./data/$(DATE).log"
+
+playback-redis-small: build-simulator
+	bin/playback -d 1 -p 0 -redis "redis3-%04d-001.fxxiur.0001.use1.cache.amazonaws.com:6379" -redisCluster 3 -s3 "tianium.ec.backup" -failover s3 -file ./data/$(DATE)_redis /trace/docker_traces/data_centers/csv/dal09_blobs_50h.csv 1>./data/$(DATE).log 2>&1 &
+	@echo "show log: tail -f ./data/$(DATE).log"
+
+playback-redis-accelerated: build-simulator
+	./playback.sh custom /trace/docker_traces/data_centers/csv/dal09_blobs_50h.csv redis '-speed 10 -d 1 -p 0 -c 0 -redis "redis8-%04d-001.oqyub3.0001.use1.cache.amazonaws.com:6379" -redisCluster 8 -s3 "tianium.ec.backup" -failover s3' 1>./log 2>&1 &
+	@echo "show log: tail -f log"
 
 playback-static: build build-simulator
-	./playback.sh /trace/docker_traces/data_centers/csv/dal09_blobs_50h.csv 400 "-cluster=static -functions=400" "-d=10 -p=2 -fo=300" -enable-dashboard 1>./log 2>&1 &
+	./playback.sh playback /trace/docker_traces/data_centers/csv/dal09_blobs_50h.csv 400 "-cluster=static -functions=400" "-d=10 -p=2 -fo=300" -enable-dashboard 1>./log 2>&1 &
 
 playback-static-average: build build-simulator
-	./playback.sh /trace/docker_traces/data_centers/csv/dal09_blobs_50h.csv 95 "-cluster=static -functions=95" "-d=10 -p=2 -fo=95" -enable-dashboard 1>./log 2>&1 &
+	./playback.sh playback /trace/docker_traces/data_centers/csv/dal09_blobs_50h.csv 95 "-cluster=static -functions=95" "-d=10 -p=2 -fo=95" -enable-dashboard 1>./log 2>&1 &
 
 playback-static-norecovery: build build-simulator
-	./playback.sh /trace/docker_traces/data_centers/csv/dal09_blobs_50h.csv 400 "-cluster=static -functions=400 -disable-recovery" "-d=10 -p=2" 1>./log 2>&1 &
+	./playback.sh playback /trace/docker_traces/data_centers/csv/dal09_blobs_50h.csv 400 "-cluster=static -functions=400 -disable-recovery" "-d=10 -p=2" 1>./log 2>&1 &
 
 start-server: build
 	./server.sh 1>./log 2>&1 &

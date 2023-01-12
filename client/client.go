@@ -3,7 +3,9 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	sysnet "net"
+	"sync/atomic"
 
 	"github.com/buraksezer/consistent"
 	"github.com/klauspost/reedsolomon"
@@ -14,12 +16,13 @@ import (
 	"github.com/sionreview/sion/common/net"
 	"github.com/sionreview/sion/common/redeo/client"
 	"github.com/sionreview/sion/common/sync"
+	"github.com/sionreview/sion/common/util"
 )
 
 var (
 	log = &logger.ColorLogger{
 		Prefix: "EcRedis ",
-		Level:  logger.LOG_LEVEL_INFO,
+		Level:  logger.LOG_LEVEL_WARN,
 		Color:  false,
 	}
 	Hasher   = &hasher{partitionCount: 271}
@@ -51,7 +54,7 @@ type Client struct {
 	conns map[string][]*client.Conn
 	// mappingTable map[string]*cuckoo.Filter
 	logEntry logEntry
-	shortcut bool
+	shortcut *net.ShortcutConn
 	closed   bool
 }
 
@@ -110,10 +113,7 @@ func (c *Client) Close() {
 func (c *Client) initDial(address string) (string, error) {
 	// initialize parallel connections under address
 	connect := c.connect
-	c.shortcut = false
-	_, ok := net.Shortcut.Validate(address)
-	if ok {
-		c.shortcut = true
+	if _, ok := net.Shortcut.Validate(address); ok {
 		connect = c.connectShortcut
 	}
 	// Connect use original address
@@ -133,41 +133,34 @@ func (c *Client) connect(addr string, n int) error {
 }
 
 func (c *Client) connectShortcut(addr string, n int) error {
-	shortcuts, ok := net.Shortcut.Dial(addr)
+	var ok bool
+	c.shortcut, ok = net.Shortcut.GetConn(addr)
 	if !ok {
 		return ErrDialShortcut
 	}
 	c.conns[addr] = make([]*client.Conn, n)
-	for i := 0; i < n && i < len(shortcuts); i++ {
+	for i := 0; i < n; i++ {
 		c.validate(addr, i)
 	}
 	return nil
 }
 
 func (c *Client) validate(address string, i int) (cn *client.Conn, err error) {
-	// Because shortcut can not be closed, we don't consider it here.
 	if c.conns[address][i] == nil || c.conns[address][i].IsClosed() {
 		var conn sysnet.Conn
-		if !c.shortcut {
+		// Dial
+		if c.shortcut == nil || c.shortcut.Address != address {
 			conn, err = sysnet.Dial("tcp", address)
-			if err == nil {
-				c.conns[address][i] = client.NewConn(conn, func(cn *client.Conn) {
-					cn.Meta = &ClientConnMeta{Addr: address, AddrIdx: i}
-					cn.SetWindowSize(2) // use 2 to form pipeline
-					cn.Handler = c
-				})
-			}
 		} else {
-			shortcut, ok := net.Shortcut.GetConn(address)
-			if !ok {
-				err = ErrDialShortcut
-			} else {
-				c.conns[address][i] = client.NewShortcut(shortcut.Validate(i).Conns[i], func(cn *client.Conn) {
-					cn.Meta = &ClientConnMeta{Addr: address, AddrIdx: i}
-					cn.SetWindowSize(2) // use 2 to form pipeline
-					cn.Handler = c
-				})
-			}
+			conn = c.shortcut.Validate(i).Conns[i].Client
+		}
+		// Wrap connection
+		if err == nil {
+			c.conns[address][i] = client.NewConn(conn, func(cn *client.Conn) {
+				cn.Meta = &ClientConnMeta{Addr: address, AddrIdx: i}
+				cn.SetWindowSize(2) // use 2 to form pipeline
+				cn.Handler = c
+			})
 		}
 	}
 	cn = c.conns[address][i]
@@ -188,7 +181,8 @@ type ecRetMeta struct {
 
 type ecRet struct {
 	sync.WaitGroup
-	reqs []*ClientRequest
+	reqs  []*ClientRequest
+	numOK int32
 
 	Shards int
 	Err    error
@@ -209,35 +203,26 @@ func (r *ecRet) Len() int {
 
 func (r *ecRet) Request(i int) *ClientRequest {
 	if r.reqs[i] == nil {
-		if r.Err != nil {
-			r.Done()
-			return nil
-		}
 		ctx := context.WithValue(context.Background(), CtxKeyECRet, r)
 		req := &ClientRequest{Request: client.NewRequestWithContext(ctx)}
-		req.OnRespond(func(_ interface{}, err error) {
-			if req.Cancel != nil {
-				req.Cancel()
+		req.OnRespond(func(rsp interface{}, err error, reason string) {
+			// In case of timeout, we don't know what blocks the connection. Close it to force a new connection to be created next time.
+			if util.IsConnectionFailed(err) {
+				util.CloseWithReason(req.Conn(), fmt.Sprintf("closedResponded:%s", reason))
 			}
+
+			// Keep record of the last error
 			if err != nil {
 				r.Err = err
+			} else if rsp != nil {
+				// Only count ok if response is not nil
+				atomic.AddInt32(&r.numOK, 1)
 			}
 			r.Done()
 		})
 		r.reqs[i] = req
 	}
 	return r.reqs[i]
-}
-
-func (r *ecRet) Set(i int, ret interface{}) {
-	req := r.reqs[i]
-	if req != nil {
-		req.SetResponse(ret)
-	}
-}
-
-func (r *ecRet) SetError(i int, err error) {
-	r.Set(i, err)
 }
 
 func (r *ecRet) RetStore(i int) (ret string) {
@@ -267,4 +252,31 @@ func (r *ecRet) Error(i int) (err error) {
 	}
 	_, err = r.Request(i).Response()
 	return
+}
+
+func (r *ecRet) PrintErrors(prompts string, args ...interface{}) {
+	if r.Err == nil {
+		return
+	}
+
+	// Format prompts
+	if len(args) > 0 {
+		prompts = fmt.Sprintf(prompts, args...)
+	}
+
+	// Print errors
+	if r.NumOK() < len(r.reqs) {
+		log.Warn("%s:%v, details(%d):", prompts, r.Err, r.NumOK())
+	} else {
+		log.Warn("%s:%v", prompts, r.Err)
+	}
+	for i := 0; i < len(r.reqs); i++ {
+		if err := r.Error(i); err != nil {
+			log.Warn("%s(%d):%v", prompts, i, err)
+		}
+	}
+}
+
+func (r *ecRet) NumOK() int {
+	return int(atomic.LoadInt32(&r.numOK))
 }

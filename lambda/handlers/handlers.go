@@ -26,12 +26,24 @@ var (
 
 func BuildPiggyback(response *worker.ObjectResponse) {
 	if Lineage != nil {
-		status := Lineage.Status(true)
+		confirmed, status := Lineage.Status(true)
 		if status != nil {
+			log.Info("Attaching unconfirmed terms: %d/%d confirmed", confirmed, status[0].Term)
 			response.PiggyFlags |= protocol.PONG_WITH_PAYLOAD | protocol.PONG_RECONCILE
 			response.PiggyPayload, _ = binary.Marshal(status.ShortStatus())
 		}
 	}
+}
+
+func GetDefaultExtension(session *lambdaLife.Session) time.Duration {
+	extension := Server.GetStats().RTT() * 2 // Expecting new requests to arrive within RTT.
+	if extension < lambdaLife.TICK_EXTENSION {
+		extension = lambdaLife.TICK_EXTENSION
+	}
+	// if session.Requests > 1 {
+	// 	extension = lambdaLife.TICK_EXTENSION
+	// }
+	return extension
 }
 
 func TestHandler(w resp.ResponseWriter, c *resp.Command) {
@@ -40,16 +52,14 @@ func TestHandler(w resp.ResponseWriter, c *resp.Command) {
 	Pong.Cancel()
 	session := lambdaLife.GetSession()
 	session.Timeout.Busy(c.Name)
-	extension := lambdaLife.TICK_ERROR
-	if session.Requests > 1 {
-		extension = lambdaLife.TICK
-	}
+	extension := GetDefaultExtension(session)
 	defer session.Timeout.DoneBusyWithReset(extension, c.Name)
 
 	log.Debug("In Test handler")
 
-	rsp, _ := Server.AddResponsesWithPreparer(c.Name, func(rsp *worker.SimpleResponse, w resp.ResponseWriter) {
+	rsp, _ := Server.AddResponsesWithPreparer(c.Name, func(rsp *worker.SimpleResponse, w resp.ResponseWriter) error {
 		w.AppendBulkString(rsp.Cmd)
+		return nil
 	}, client)
 	if err := rsp.Flush(); err != nil {
 		log.Error("Error on test::flush: %v", err)
@@ -64,21 +74,19 @@ func GetHandler(w resp.ResponseWriter, c *resp.Command) {
 	}
 
 	client := redeo.GetClient(c.Context())
+	link := worker.LinkFromClient(client)
 
 	Pong.Cancel()
 	session.Timeout.Busy(c.Name)
 	session.Requests++
-	extension := lambdaLife.TICK_ERROR
-	if session.Requests > 1 {
-		extension = lambdaLife.TICK
-	}
+	extension := GetDefaultExtension(session)
 	cmd := c.Name // Save for defer, command is reused by redeo.
 	defer Server.WaitAck(cmd, func() {
 		session.Timeout.DoneBusyWithReset(extension, cmd)
 	}, client)
 
 	t := time.Now()
-	log.Debug("In GET handler(link:%d)", worker.LinkFromClient(client).ID())
+	log.Debug("In GET handler(link:%v, extension:%v)", link, extension)
 
 	reqId := c.Arg(0).String()
 	// Skip: chunkId := c.Arg(1).String()
@@ -87,11 +95,14 @@ func GetHandler(w resp.ResponseWriter, c *resp.Command) {
 	var recovered int64
 	chunkId, stream, ret := Store.GetStream(key)
 	// Recover if not found. This is not desired if recovery is enabled and will generate a warning.
-	// Deleted chunk(ret.Error() == types.ErrDeleted) will not be recovered.
-	if (ret.Error() == types.ErrNotFound || ret.Error() == types.ErrIncomplete) && Persist != nil {
-		log.Debug("Key not found locally, try recovery: %v %s", key, reqId)
+	// Deleted chunk(ret.Error() == types.ErrDeleted) is considered as not found for reasons:
+	// 1. Meta deleted object will not be sent here.
+	// 2. The most possible reason for a key being deleted and requested again is the key has been deleted becaused cache space eviction.
+	if (ret.Error() == types.ErrNotFound || ret.Error() == types.ErrDeleted || ret.Error() == types.ErrIncomplete) && Persist != nil {
 		if Lineage != nil {
-			log.Warn("Key not found while recovery is enabled: %v", key)
+			log.Info("Key %v while recovery is enabled: %v %s", ret.Error(), key, reqId)
+		} else {
+			log.Debug("Key %v locally, try recovery: %v %s", ret.Error(), key, reqId)
 		}
 		errRsp := &worker.ErrorResponse{}
 		chunkId = c.Arg(1).String()
@@ -151,20 +162,20 @@ func GetHandler(w resp.ResponseWriter, c *resp.Command) {
 			ReqId:     reqId,
 			ChunkId:   chunkId,
 			Recovered: recovered,
-			Extension: extension,
+			Extension: extension - Server.GetStats().RTT(), // Proxy don't need to consider RTT
 		}
 		BuildPiggyback(response)
 
 		t2 := time.Now()
 		Server.AddResponses(response, client)
 		if err := response.Flush(); err != nil {
-			log.Error("Error on flush(get %s %s): %v", key, reqId, err)
-			return
+			// Error is ignored here, since the client may simply discard late response.
+			log.Warn("Error on flush(get %s %s): %v", key, reqId, err)
 		}
 		d2 := time.Since(t2)
 
 		dt := time.Since(t)
-		log.Info("Get key:%s %v, duration:%v, prepare: %v, transmission:%v", key, reqId, dt, d1, d2)
+		log.Info("Get(link:%v) key:%s %v, duration:%v, prepare: %v, transmission:%v", link, key, reqId, dt, d1, d2)
 		collector.AddRequest(t, types.OP_GET, "200", reqId, chunkId, d1, d2, dt, 0, session.Id)
 	} else {
 		var respError *ResponseError
@@ -191,27 +202,65 @@ func SetHandler(w resp.ResponseWriter, c *resp.CommandStream) {
 	}
 
 	client := redeo.GetClient(c.Context())
+	link := worker.LinkFromClient(client)
 
 	Pong.Cancel()
 	session.Timeout.Busy(c.Name)
 	session.Requests++
-	extension := lambdaLife.TICK_ERROR
-	if session.Requests > 1 {
-		extension = lambdaLife.TICK
-	}
+	extension := GetDefaultExtension(session)
 
 	t := time.Now()
-	log.Debug("In SET handler(link:%d)", worker.LinkFromClient(client).ID())
+	var t2 time.Time
+	log.Debug("In SET handler(link:%v, extension:%v)", link, extension)
 
-	var reqId, chunkId string
+	var reqId, chunkId, key string
 	cmd := c.Name
+	committed := false
 	finalize := func(ret *types.OpRet, ds ...time.Duration) {
 		Server.WaitAck(c.Name, func() {
-			if ret != nil && ret.IsDelayed() {
+			// Wait if the ret has not been concluded.
+			if ret.IsDelayed() {
 				ret.Wait()
-				collector.AddRequest(t, types.OP_SET, "200", reqId, chunkId, ds[0], ds[1], ds[2], time.Since(t), session.Id)
+			}
+			d2 := time.Since(t2)
+
+			// Confirm the object is persisted.
+			if committed && session.Input.IsWaitForCOSDisabled() {
+				var rsp worker.Response
+				if err := ret.Error(); err == nil {
+					log.Debug("Sending persisted notification: %s", key)
+					// Notification will send using control link.
+					rsp, _ = Server.AddResponsesWithPreparer(protocol.CMD_PERSISTED, func(rsp *worker.SimpleResponse, w resp.ResponseWriter) error {
+						w.AppendBulkString(rsp.Cmd)
+						w.AppendBulkString(key)
+						return nil
+					})
+				} else {
+					log.Debug("Sending persist failure notification: %s", key)
+					// Notification will send using control link.
+					rsp, _ = Server.AddResponsesWithPreparer(protocol.CMD_PERSIST_FAILED, func(rsp *worker.SimpleResponse, w resp.ResponseWriter) error {
+						w.AppendBulkString(rsp.Cmd)
+						w.AppendBulkString(key)
+						return nil
+					})
+				}
+				if err := rsp.Flush(); err != nil {
+					log.Error("Error on flush(persist key %s): %v", key, err)
+					// Ignore, network error will be handled by redeo.
+				}
+			}
+
+			// Output experiment data.
+			if err := ret.Error(); err == nil {
+				collector.AddRequest(t, types.OP_SET, "200", reqId, chunkId, ds[0], d2, ds[2], time.Since(t), session.Id)
+				if session.Input.IsWaitForCOSDisabled() {
+					log.Info("Set(link:%v) key:%s, chunk: %s, duration:%v, transmission:%v, persistence:%v", link, key, chunkId, ds[2], ds[0], d2)
+				}
 			} else {
-				// Only if error
+				// If the setstream err is net error (timeout), cut the line.
+				if util.IsConnectionFailed(err) {
+					Server.SetFailure(client, err)
+				}
 				collector.AddRequest(t, types.OP_SET, "500", reqId, chunkId, 0, 0, time.Since(t), 0, session.Id)
 			}
 			session.Timeout.DoneBusyWithReset(extension, cmd)
@@ -221,15 +270,16 @@ func SetHandler(w resp.ResponseWriter, c *resp.CommandStream) {
 	errRsp := &worker.ErrorResponse{}
 	reqId, _ = c.NextArg().String()
 	chunkId, _ = c.NextArg().String()
-	key, _ := c.NextArg().String()
+	key, _ = c.NextArg().String()
 	valReader, err := c.Next()
 	if err != nil {
 		errRsp.Error = NewResponseError(500, "Error on get value reader: %v", err)
 		Server.AddResponses(errRsp, client)
 		if err := errRsp.Flush(); err != nil {
 			log.Error("Error on flush(error 500): %v", err)
+			// Ignore, network error will be handled by redeo.
 		}
-		finalize(nil)
+		finalize(types.OpError(err))
 		return
 	}
 
@@ -237,22 +287,16 @@ func SetHandler(w resp.ResponseWriter, c *resp.CommandStream) {
 	client.Conn().SetReadDeadline(protocol.GetBodyDeadline(valReader.Len()))
 	ret := Store.SetStream(key, chunkId, valReader)
 	client.Conn().SetReadDeadline(time.Time{})
-	d1 := time.Since(t)
+	t2 = time.Now()
+	d1 := t2.Sub(t)
 	err = ret.Error()
 	if err != nil {
 		errRsp.Error = err
-		log.Error("%v", err)
 		Server.AddResponses(errRsp, client)
-
 		if err := errRsp.Flush(); err != nil {
 			log.Error("Error on flush(error 500): %v", err)
 			// Ignore, network error will be handled by redeo.
 		}
-		// If the setstream err is net error (timeout), cut the line.
-		if util.IsConnectionFailed(err) {
-			Server.SetFailure(client, err)
-		}
-
 		finalize(ret)
 		return
 	}
@@ -262,24 +306,36 @@ func SetHandler(w resp.ResponseWriter, c *resp.CommandStream) {
 		BaseResponse: worker.BaseResponse{Cmd: c.Name},
 		ReqId:        reqId,
 		ChunkId:      chunkId,
-		Extension:    extension,
+		Extension:    extension - Server.GetStats().RTT(), // Proxy don't need to consider RTT
 	}
 	BuildPiggyback(response)
 
 	if !session.Input.IsWaitForCOSDisabled() {
-		ret.Wait()
+		err := ret.Wait()
+		if err != nil {
+			errRsp.Error = err
+			Server.AddResponses(errRsp, client)
+			if err := errRsp.Flush(); err != nil {
+				log.Error("Error on flush(error 500): %v", err)
+				// Ignore, network error will be handled by redeo.
+			}
+			finalize(ret)
+			return
+		}
 	}
+	d2 := time.Since(t2)
 
-	t2 := time.Now()
 	Server.AddResponses(response, client)
 	if err := response.Flush(); err != nil {
 		log.Error("Error on set::flush(set key %s): %v", key, err)
 		// Ignore
 	}
-	d2 := time.Since(t2)
-
 	dt := time.Since(t)
-	log.Info("Set key:%s, chunk: %s, duration:%v, transmission:%v", key, chunkId, dt, d1)
+	committed = true
+
+	if !session.Input.IsWaitForCOSDisabled() {
+		log.Info("Set(link:%v) key:%s, chunk: %s, duration:%v, transmission:%v, persistence:%v", link, key, chunkId, dt, d1, d2)
+	}
 	finalize(ret, d1, d2, dt)
 }
 
@@ -291,14 +347,13 @@ func RecoverHandler(w resp.ResponseWriter, c *resp.Command) {
 	}
 
 	client := redeo.GetClient(c.Context())
+	link := worker.LinkFromClient(client)
 
 	Pong.Cancel()
 	session.Timeout.Busy(c.Name)
 	session.Requests++
-	extension := lambdaLife.TICK_ERROR
-	if session.Requests > 1 {
-		extension = lambdaLife.TICK
-	}
+	extension := GetDefaultExtension(session)
+
 	var ret *types.OpRet
 	cmd := c.Name
 	defer Server.WaitAck(cmd, func() {
@@ -309,7 +364,7 @@ func RecoverHandler(w resp.ResponseWriter, c *resp.Command) {
 	}, client)
 
 	t := time.Now()
-	log.Debug("In RECOVER handler(link:%d)", worker.LinkFromClient(client).ID())
+	log.Debug("In RECOVER handler(link:%v, extension:%v)", link, extension)
 
 	errRsp := &worker.ErrorResponse{}
 	reqId := c.Arg(0).String()
@@ -377,7 +432,7 @@ func RecoverHandler(w resp.ResponseWriter, c *resp.Command) {
 		ReqId:     reqId,
 		ChunkId:   chunkId,
 		Recovered: 1,
-		Extension: extension,
+		Extension: extension - Server.GetStats().RTT(), // Proxy don't need to consider RTT
 	}
 	BuildPiggyback(response)
 
@@ -390,7 +445,7 @@ func RecoverHandler(w resp.ResponseWriter, c *resp.Command) {
 	d2 := time.Since(t2)
 
 	dt := time.Since(t)
-	log.Debug("Recover complete, Key:%s, ChunkID: %s", key, chunkId)
+	log.Info("Recovered(link:%v) key:%s %s, duration:%v, prepare: %v, transmission:%v", link, key, reqId, dt, d1, d2)
 	if retCmd == protocol.CMD_GET {
 		collector.AddRequest(t, types.OP_RECOVER, "200", reqId, chunkId, d1, d2, dt, 0, session.Id)
 	}
@@ -408,10 +463,8 @@ func DelHandler(w resp.ResponseWriter, c *resp.Command) {
 	Pong.Cancel()
 	session.Timeout.Busy(c.Name)
 	session.Requests++
-	extension := lambdaLife.TICK_ERROR
-	if session.Requests > 1 {
-		extension = lambdaLife.TICK
-	}
+	extension := GetDefaultExtension(session)
+
 	var ret *types.OpRet
 	cmd := c.Name
 	defer Server.WaitAck(cmd, func() {
@@ -435,7 +488,7 @@ func DelHandler(w resp.ResponseWriter, c *resp.Command) {
 			BaseResponse: worker.BaseResponse{Cmd: c.Name},
 			ReqId:        reqId,
 			ChunkId:      chunkId,
-			Extension:    extension,
+			Extension:    extension - Server.GetStats().RTT(), // Proxy don't need to consider RTT
 		}
 		BuildPiggyback(response)
 		Server.AddResponses(response, client)
@@ -476,9 +529,10 @@ func DataHandler(w resp.ResponseWriter, c *resp.Command) {
 	// put DATA to s3
 	collector.Save()
 
-	rsp, _ := Server.AddResponsesWithPreparer(c.Name, func(rsp *worker.SimpleResponse, w resp.ResponseWriter) {
+	rsp, _ := Server.AddResponsesWithPreparer(c.Name, func(rsp *worker.SimpleResponse, w resp.ResponseWriter) error {
 		w.AppendBulkString(rsp.Cmd)
 		w.AppendBulkString("OK")
+		return nil
 	}, client)
 
 	if err := rsp.Flush(); err != nil {

@@ -1,7 +1,7 @@
 package client
 
 import (
-	"context"
+	"fmt"
 	"math/rand"
 	sysSync "sync"
 	"sync/atomic"
@@ -29,27 +29,29 @@ type RequestMeta struct {
 	// Request embeds application level requests.
 	Request
 
+	// Sent indicates the request has been sent successfully.
+	Sent bool
+
 	// Acked indicates the request is acknownledged.
 	Acked bool
 
-	// Deadline suggests default deadline of the requests. It can be overridden by request's context.
+	// Deadline suggests deadline of the request's reponse header.
 	Deadline time.Time
 
 	// Notifier unblocks the request on window advancing.
 	Notifier sync.WaitGroup
 }
 
-// IsTimeout returns if the request is timeout given the status of the request's context.
-func (m *RequestMeta) IsTimeout(t time.Time) bool {
-	if m.Acked || m.Notifier.IsWaiting() {
-		return false
+// IsTimeout returns if the request is timeout given specified deadline.
+func (m *RequestMeta) testTimeout(t time.Time) error {
+	if !m.Sent || m.Acked || m.Notifier.IsWaiting() {
+		return nil
 	}
 
-	dl, ok := m.Context().Deadline()
-	if !ok {
-		dl = m.Deadline
+	if m.Deadline.Before(t) {
+		return ErrTimeout
 	}
-	return dl.Before(t)
+	return nil
 }
 
 type ReqBucket struct {
@@ -61,13 +63,24 @@ type ReqBucket struct {
 	refs     int32 // reference counter of the bucket, if refs is not 0, cannot be reset
 }
 
+func newReqBucket(seq int64) *ReqBucket {
+	return &ReqBucket{
+		seq:      seq,
+		requests: make([]*RequestMeta, BucketSize),
+		next:     NilBucket,
+	}
+}
+
 func (b *ReqBucket) Reset() {
 	if b.acked < b.filled {
 		for i := 0; i < len(b.requests); i++ {
-			if b.requests[i] != nil && !b.requests[i].Acked {
-				_ = b.requests[i].SetResponse(ErrConnectionClosed)
-				b.requests[i] = nil
+			if b.requests[i] == nil {
+				continue
 			}
+			if b.requests[i].Sent && !b.requests[i].Acked {
+				_ = b.requests[i].SetResponse(ErrConnectionClosed, "connection cleanup")
+			}
+			b.requests[i] = nil
 		}
 	}
 	b.refs = 0
@@ -93,6 +106,16 @@ func (b *ReqBucket) Refs() int {
 	return int(atomic.LoadInt32(&b.refs))
 }
 
+func (b *ReqBucket) String() string {
+	if b == NilBucket {
+		return "NilBucket"
+	} else if b.seq == 0 {
+		return "UnexpectedBucket"
+	} else {
+		return fmt.Sprintf("Bucket %d", b.seq)
+	}
+}
+
 type Window struct {
 	seq    int64 // Max sequence seen.
 	top    *ReqBucket
@@ -110,16 +133,13 @@ type Window struct {
 
 func NewWindow() *Window {
 	rand.Seed(time.Now().UnixNano())
+	seqStart := rand.Int63n(SeqStep)
 	wnd := &Window{
-		seq: rand.Int63n(SeqStep),
-		top: &ReqBucket{
-			requests: make([]*RequestMeta, BucketSize),
-			next:     NilBucket,
-		},
+		seq:    seqStart,
+		top:    newReqBucket(seqStart + SeqStep),
 		size:   WindowSize,
 		closed: make(chan struct{}),
 	}
-	wnd.top.seq = wnd.seq + SeqStep
 	wnd.active = wnd.top
 	wnd.tail = wnd.top
 	wnd.acked = wnd.seq
@@ -182,7 +202,7 @@ func (wnd *Window) AddRequest(req Request) (*RequestMeta, error) {
 		active.DeRef()
 		active = wnd.active.Ref()
 	}
-	bucket, i, err := wnd.seek(seq, active, true)
+	bucket, i, err := wnd.seekRLocked(seq, active, true)
 	if err != nil {
 		return nil, err
 	}
@@ -213,7 +233,7 @@ func (wnd *Window) MatchRequest(seq int64) (Request, error) {
 		return nil, ErrConnectionClosed
 	}
 
-	_, _, meta, err := wnd.findRequestMeta(seq)
+	_, _, meta, err := wnd.findRequestMetaRLocked(seq)
 	if err != nil {
 		return nil, err
 	}
@@ -222,6 +242,11 @@ func (wnd *Window) MatchRequest(seq int64) (Request, error) {
 }
 
 func (wnd *Window) AckRequest(seq int64) (Request, error) {
+	// Avoid deadlock: the requests will be cleared during closing.
+	if wnd.IsClosed() {
+		return nil, ErrConnectionClosed
+	}
+
 	wnd.mu.RLock()
 	defer wnd.mu.RUnlock()
 
@@ -230,7 +255,7 @@ func (wnd *Window) AckRequest(seq int64) (Request, error) {
 	}
 
 	// Locate the request.
-	bucket, i, meta, err := wnd.findRequestMeta(seq)
+	bucket, i, meta, err := wnd.findRequestMetaRLocked(seq)
 	if err != nil {
 		return nil, err
 	}
@@ -260,7 +285,7 @@ func (wnd *Window) AckRequest(seq int64) (Request, error) {
 		// log.Printf("Update acked to %d, try release %d", acked, seq+atomic.LoadInt64(&wnd.size)*SeqStep)
 
 		// Notify possible blocked requests.
-		blocked, i, _ = wnd.seek(seq+atomic.LoadInt64(&wnd.size)*SeqStep, blocked.Ref(), false)
+		blocked, i, _ = wnd.seekRLocked(seq+atomic.LoadInt64(&wnd.size)*SeqStep, blocked.Ref(), false)
 		if blocked != NilBucket {
 			meta := blocked.requests[i]
 			if meta != nil {
@@ -276,7 +301,7 @@ func (wnd *Window) AckRequest(seq int64) (Request, error) {
 		if seq > atomic.LoadInt64(&wnd.seq) {
 			break
 		}
-		bucket, i, _ = wnd.seek(seq, bucket.Ref(), false)
+		bucket, i, _ = wnd.seekRLocked(seq, bucket.Ref(), false)
 		if bucket == NilBucket {
 			break
 		}
@@ -308,7 +333,7 @@ func (wnd *Window) Close() error {
 
 	for bucket := wnd.top; bucket != NilBucket; bucket, bucket.next = bucket.next, nil {
 		bucket.Reset()
-		bucket.requests = nil
+		// bucket.requests = nil
 	}
 	wnd.top = nil
 	wnd.active = nil
@@ -320,29 +345,30 @@ func (wnd *Window) IsClosed() bool {
 	return atomic.LoadInt32(&wnd.close) == 1
 }
 
-func (wnd *Window) seek(seq int64, bucket *ReqBucket, forSet bool) (*ReqBucket, int64, error) {
+func (wnd *Window) seekRLocked(seq int64, bucket *ReqBucket, forSet bool) (*ReqBucket, int64, error) {
 	// defer bucket.DeRef()
 	i := seq - bucket.seq
 	var err error
 	for i >= BucketSize*SeqStep {
 		if forSet {
-			bucket, err = wnd.prepareNextBucketForSet(bucket)
+			bucket, err = wnd.prepareNextBucketForSetRLocked(bucket)
 			if err != nil {
 				return bucket, i / SeqStep, err
 			}
 		} else {
 			bucket = bucket.Next()
 			if bucket == NilBucket {
+				err = ErrNotSeen
 				break
 			}
 		}
 		i = seq - bucket.seq
 	}
 	bucket.DeRef()
-	return bucket, i / SeqStep, nil
+	return bucket, i / SeqStep, err
 }
 
-func (wnd *Window) findRequestMeta(seq int64) (*ReqBucket, int64, *RequestMeta, error) {
+func (wnd *Window) findRequestMetaRLocked(seq int64) (*ReqBucket, int64, *RequestMeta, error) {
 	if seq <= atomic.LoadInt64(&wnd.acked) {
 		// log.Printf("acked seq: %d, acked: %d", seq, acked)
 		return nil, 0, nil, ErrAcked
@@ -352,10 +378,10 @@ func (wnd *Window) findRequestMeta(seq int64) (*ReqBucket, int64, *RequestMeta, 
 	}
 
 	// Seek and locate meta
-	bucket, i, _ := wnd.seek(seq, wnd.active.Ref(), false)
-	if bucket == NilBucket {
+	bucket, i, err := wnd.seekRLocked(seq, wnd.active.Ref(), false)
+	if err != nil {
 		// log.Printf("unseen seq: %d, no more bucket", seq)
-		return bucket, i, nil, ErrNotSeen
+		return bucket, i, nil, err
 	}
 	meta := bucket.requests[i]
 	if meta == nil {
@@ -369,7 +395,7 @@ func (wnd *Window) findRequestMeta(seq int64) (*ReqBucket, int64, *RequestMeta, 
 	return bucket, i, meta, nil
 }
 
-func (wnd *Window) prepareNextBucketForSet(bucket *ReqBucket) (*ReqBucket, error) {
+func (wnd *Window) prepareNextBucketForSetRLocked(bucket *ReqBucket) (*ReqBucket, error) {
 	if bucket.next != NilBucket {
 		return bucket.Next(), nil
 	}
@@ -386,11 +412,7 @@ func (wnd *Window) prepareNextBucketForSet(bucket *ReqBucket) (*ReqBucket, error
 	}
 
 	if bucket == wnd.tail {
-		wnd.tail.next = &ReqBucket{
-			seq:      wnd.tail.seq + BucketSize*SeqStep,
-			requests: make([]*RequestMeta, BucketSize),
-			next:     NilBucket,
-		}
+		wnd.tail.next = newReqBucket(wnd.tail.seq + BucketSize*SeqStep)
 		wnd.tail = wnd.tail.next
 	}
 	return bucket.Next(), nil
@@ -420,14 +442,21 @@ func (wnd *Window) cleanUp() {
 			bucket := wnd.active
 			i := int64(0)
 			for j := int64(0); j < atomic.LoadInt64(&wnd.size); j++ {
-				bucket, i, _ = wnd.seek(seq+j, bucket.Ref(), false)
+				wnd.mu.RLock()
+				bucket, i, _ = wnd.seekRLocked(seq+j*SeqStep, bucket.Ref(), false)
 				if bucket == NilBucket {
+					wnd.mu.RUnlock()
 					break
 				}
-
+				// In lock, get a reference of the meta to avoid wnd being closed
 				meta := bucket.requests[i]
-				if meta != nil && meta.IsTimeout(t) {
-					_ = meta.SetResponse(context.DeadlineExceeded)
+				wnd.mu.RUnlock()
+
+				if meta == nil {
+					continue
+				} else if err := meta.testTimeout(t); err != nil {
+					// Note that the request must have benn sent. Timeout on write will not be tested.
+					meta.SetResponse(err, "response timeout")
 					req := meta.Request
 					if req != nil {
 						_, _ = wnd.AckRequest(req.Seq())

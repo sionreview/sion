@@ -66,6 +66,12 @@ cloudwatch/download.sh ${EXPERIMENT} log
 ### Workload Processing Log
 
 ~~~
+workload/preprocess.sh ${EXPERIMENT}
+~~~
+
+or
+
+~~~
 # Unzip
 mkdir -p downloaded/proxy/${EXPERIMENT}
 tar -xzf downloaded/proxy/${EXPERIMENT}.tar.gz -C downloaded/proxy/${EXPERIMENT}/
@@ -82,10 +88,4 @@ cloudwatch/parse.sh downloaded/log/${EXPERIMENT}
 cat downloaded/log/${EXPERIMENT}_bill.csv | grep invocation > downloaded/${EXPERIMENT}/bill.csv
 make build-data
 bin/preprocess -o downloaded/${EXPERIMENT}/recovery.csv -processor workload -fprefix FunctionPrefix downloaded/data/${EXPERIMENT}
-~~~
-
-or simply
-
-~~~
-workload/preprocess.sh ${EXPERIMENT}
 ~~~

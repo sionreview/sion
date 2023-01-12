@@ -66,12 +66,12 @@ func (p *PongHandler) Issue(retry bool) bool {
 	}
 }
 
-// Send Send ack(pong) on control link, must call Issue(bool) first. Pong will keep retrying until maximum attempts reaches or is cancelled.
+// Send Send ack(pong) on control link, must call Issue(bool) first. Pong will keep retrying until maximum attempts reaches or is canceled.
 func (p *PongHandler) Send() error {
 	return p.sendImpl(protocol.PONG_FOR_CTRL, nil, nil, false)
 }
 
-// Send Send ack(pong) with flags on control link, must call Issue(bool) first. Pong will keep retrying until maximum attempts reaches or is cancelled.
+// Send Send ack(pong) with flags on control link, must call Issue(bool) first. Pong will keep retrying until maximum attempts reaches or is canceled.
 func (p *PongHandler) SendWithFlags(flags int64, paylaod []byte) error {
 	return p.sendImpl(flags, paylaod, nil, false)
 }
@@ -99,7 +99,7 @@ func (p *PongHandler) Cancel() {
 	p.mu.Unlock()
 }
 
-// IsCancelled If the expected request has been received and pong has benn cancelled.
+// IsCancelled If the expected request has been received and pong has benn canceled.
 func (p *PongHandler) IsCancelled() bool {
 	return p.requested.IsResolved()
 }
@@ -188,15 +188,21 @@ func pongLog(flags int64, link *worker.Link) {
 }
 
 func sendPong(link *worker.Link, flags int64, payload []byte) error {
-	store.Server.AddResponsesWithPreparer(protocol.CMD_PONG, func(rsp *worker.SimpleResponse, w resp.ResponseWriter) {
+	store.Server.AddResponsesWithPreparer(protocol.CMD_PONG, func(rsp *worker.SimpleResponse, w resp.ResponseWriter) error {
 		rsp.Attempts = 1
+		sess := lambdaLife.GetSession()
+		// Session should be available by now. If not, ignore the pong.
+		// In warmup invocation, the function can return so quick that the session ends before the pong is sent.
+		if sess == nil {
+			return worker.ErrShouldIgnore
+		}
 		// CMD
 		w.AppendBulkString(rsp.Cmd)
 		// WorkerID + StoreID
 		// fmt.Printf("store id:%d, worker id:%d, sent: %d\n", store.Store.Id(), store.Server.Id(), int64(store.Store.Id())+int64(store.Server.Id())<<32)
 		w.AppendInt(int64(store.Store.Id()) + int64(store.Server.Id())<<32)
 		// Sid
-		w.AppendBulkString(lambdaLife.GetSession().Sid)
+		w.AppendBulkString(sess.Sid)
 		// Flags
 		w.AppendInt(flags)
 		// Piggyback payload
@@ -204,6 +210,7 @@ func sendPong(link *worker.Link, flags int64, payload []byte) error {
 			// Payload
 			w.AppendBulk(payload)
 		}
+		return nil
 	}, link)
 	// return rsp.Flush()
 	return nil

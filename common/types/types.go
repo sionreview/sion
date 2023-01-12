@@ -1,6 +1,8 @@
 package types
 
-import "net"
+import (
+	"net"
+)
 
 // InputEvent Input for the Lambda
 type InputEvent struct {
@@ -103,8 +105,6 @@ func (e *OutputError) String() string {
 const (
 	// FLAG_ENABLE_WARMUP Enable warmup.
 	FLAG_ENABLE_WARMUP = 0x0001
-	// FLAG_FIXED_INTERVAL_WARMUP Warming up with fixed interval regardless workload.
-	FLAG_FIXED_INTERVAL_WARMUP = 0x0002
 
 	// FLAG_ENABLE_REPLICA Enable replication.
 	FLAG_ENABLE_REPLICA = 0x0010
@@ -138,23 +138,25 @@ const (
 	// PONG_RECONCILE Pong with reconcile meta included.
 	PONG_RECONCILE = int64(0x0100)
 
-	CMD_TEST        = "test"
-	CMD_ACK         = "ack"         // Control command
-	CMD_GET         = "get"         // Redis and Lambda command
-	CMD_GET_CHUNK   = "get chunk"   // Client command
-	CMD_SET         = "set"         // Redis and Lambda command
-	CMD_SET_CHUNK   = "set chunk"   // Client command
-	CMD_RECOVER     = "recover"     // Control command
-	CMD_DEL         = "del"         // Control command
-	CMD_WARMUP      = "warmup"      // Control command
-	CMD_PING        = "ping"        // Control command
-	CMD_PONG        = "pong"        // Control command
-	CMD_RECOVERED   = "recovered"   // Control command
-	CMD_INITMIGRATE = "initMigrate" // Control command
-	CMD_MIGRATE     = "migrate"     // Control command
-	CMD_MHELLO      = "mhello"      // Control command
-	CMD_DATA        = "data"        // Control command
-	CMD_BYE         = "bye"         // Control command
+	CMD_TEST           = "test"
+	CMD_ACK            = "ack"            // Control command
+	CMD_GET            = "get"            // Redis and Lambda command
+	CMD_GET_CHUNK      = "get chunk"      // Client command
+	CMD_SET            = "set"            // Redis and Lambda command
+	CMD_SET_CHUNK      = "set chunk"      // Client command
+	CMD_PERSISTED      = "persisted"      // Control command
+	CMD_PERSIST_FAILED = "persist failed" // Control command
+	CMD_RECOVER        = "recover"        // Control command
+	CMD_DEL            = "del"            // Control command
+	CMD_WARMUP         = "warmup"         // Control command
+	CMD_PING           = "ping"           // Control command
+	CMD_PONG           = "pong"           // Control command
+	CMD_RECOVERED      = "recovered"      // Control command
+	CMD_INITMIGRATE    = "initMigrate"    // Control command
+	CMD_MIGRATE        = "migrate"        // Control command
+	CMD_MHELLO         = "mhello"         // Control command
+	CMD_DATA           = "data"           // Control command
+	CMD_BYE            = "bye"            // Control command
 
 	REQUEST_GET_OPTIONAL      = 0x0001 // Flag response is optional. There is a compete fallback will eventually fulfill the request.
 	REQUEST_GET_OPTION_BUFFER = 0x0002 // Flag the chunk should be put in buffer area.

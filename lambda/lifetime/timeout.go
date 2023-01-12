@@ -11,7 +11,7 @@ import (
 	protocol "github.com/sionreview/sion/common/types"
 )
 
-const TICK = 100 * time.Millisecond
+const TICK_EXTENSION = 100 * time.Millisecond
 
 // For Lambdas below 0.5vCPU(896M).
 const TICK_1_ERROR_EXTEND = 10000 * time.Millisecond
@@ -26,6 +26,7 @@ const TICK_10_ERROR_EXTEND = 1000 * time.Millisecond
 const TICK_10_ERROR = 2 * time.Millisecond
 
 var (
+	TICK              = 100 * time.Millisecond
 	TICK_ERROR_EXTEND = TICK_10_ERROR_EXTEND
 	TICK_ERROR        = TICK_10_ERROR
 
@@ -33,7 +34,8 @@ var (
 	MemoryLimitInMB = 3096
 )
 
-func init() {
+// Set public to allow reconfiguration.
+func Init() {
 	// adapt
 	if lambdacontext.MemoryLimitInMB > 0 {
 		MemoryLimitInMB = lambdacontext.MemoryLimitInMB
@@ -48,6 +50,9 @@ func init() {
 	} else {
 		TICK_ERROR_EXTEND = TICK_10_ERROR_EXTEND
 		TICK_ERROR = TICK_10_ERROR
+	}
+	if TICK == 1*time.Millisecond {
+		TICK_ERROR = 0
 	}
 }
 

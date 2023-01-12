@@ -21,5 +21,5 @@ if [ "$2" != "" ] ; then
 fi
 
 mkdir -p $DOWNLOAD
-ssh -i ~/.ssh/sion -t $REMOTE "cd $DATA && tar -czf $FOLDER.tar.gz $FOLDER $FOLDER*.log $FOLDER*.clog logs/$FOLDER"
-scp -i ~/.ssh/sion $REMOTE:$DATA/$FOLDER.tar.gz $DOWNLOAD
+ssh -t $REMOTE "cd $DATA && tar -czf $FOLDER.tar.gz $FOLDER $FOLDER*.log $FOLDER*.clog logs/$FOLDER"
+scp $REMOTE:$DATA/$FOLDER.tar.gz $DOWNLOAD

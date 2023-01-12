@@ -3,6 +3,7 @@ package net
 import (
 	"fmt"
 	"regexp"
+	"sync/atomic"
 
 	mock "github.com/jordwest/mock-conn"
 	"github.com/sionreview/sion/common/util/hashmap"
@@ -13,7 +14,7 @@ var (
 	Shortcut *shortcut
 
 	// Concurency Estimate concurrency required.
-	Concurrency = 100
+	Concurrency = 1000
 
 	shortcutAddress    = "shortcut:%d:%s"
 	shortcutRecognizer = regexp.MustCompile(`^shortcut:[0-9]+:(.+)$`)
@@ -26,7 +27,7 @@ type shortcut struct {
 func InitShortcut() *shortcut {
 	if Shortcut == nil {
 		Shortcut = &shortcut{
-			ports: hashmap.NewMap(200), // Concurrency * 2
+			ports: hashmap.NewMapWithStringKey(Concurrency),
 		}
 	}
 	return Shortcut
@@ -85,29 +86,44 @@ func (s *shortcut) Invalidate(conn *ShortcutConn) {
 }
 
 type MockConn struct {
-	*mock.Conn
+	Server *MockEnd
+	Client *MockEnd
+
+	mock   *mock.Conn
 	parent *ShortcutConn
 	idx    int
+	id     int32
 }
 
-func NewMockConn(scn *ShortcutConn, idx int) *MockConn {
-	return &MockConn{
-		Conn:   mock.NewConn(),
+func NewMockConn(scn *ShortcutConn, idx int, id int32) *MockConn {
+	mock := mock.NewConn()
+	conn := &MockConn{
+		mock:   mock,
 		parent: scn,
 		idx:    idx,
+		id:     id,
 	}
+	conn.Server = &MockEnd{End: mock.Server, parent: conn}
+	conn.Client = &MockEnd{End: mock.Client, parent: conn}
+	return conn
 }
 
 func (c *MockConn) String() string {
-	return fmt.Sprintf("%s[%d]", c.parent.Address, c.idx)
+	return fmt.Sprintf("%s(%d)[%d]", c.parent.Address, c.idx, c.id)
 }
 
 func (c *MockConn) Close() error {
 	return c.parent.close(c.idx, c)
 }
 
-func (c *MockConn) Invalid() {
-	c.parent.Conns[c.idx] = nil
+func (c *MockConn) invalid() bool {
+	return c.parent.invalid(c.idx, c)
+}
+
+func (c *MockConn) close() error {
+	c.Server.setStatus("dropped")
+	c.Client.setStatus("dropped")
+	return c.mock.Close()
 }
 
 type ShortcutConn struct {
@@ -115,6 +131,7 @@ type ShortcutConn struct {
 	Client     interface{}
 	Address    string
 	OnValidate func(*MockConn)
+	seq        int32
 }
 
 func NewShortcutConn(addr string, n int) *ShortcutConn {
@@ -142,12 +159,20 @@ func (cn *ShortcutConn) Close(idxes ...int) {
 }
 
 func (cn *ShortcutConn) close(i int, conn *MockConn) error {
-	if conn != nil {
+	if conn != nil && conn == cn.Conns[i] {
 		cn.Conns[i] = nil
-		return conn.Close()
+		return conn.close()
 	}
 
 	return nil
+}
+
+func (cn *ShortcutConn) invalid(i int, conn *MockConn) bool {
+	if conn == cn.Conns[i] {
+		cn.Conns[i] = nil
+		return true
+	}
+	return false
 }
 
 func (cn *ShortcutConn) Validate(idxes ...int) *ShortcutConn {
@@ -165,7 +190,7 @@ func (cn *ShortcutConn) Validate(idxes ...int) *ShortcutConn {
 
 func (cn *ShortcutConn) validate(i int, conn *MockConn) {
 	if conn == nil {
-		cn.Conns[i] = NewMockConn(cn, i)
+		cn.Conns[i] = NewMockConn(cn, i, atomic.AddInt32(&cn.seq, 1))
 		cn.OnValidate(cn.Conns[i])
 	}
 }

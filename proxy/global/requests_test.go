@@ -34,7 +34,7 @@ func (c *TestRequestCounter) Close() {
 func newRequest(counter *TestRequestCounter, chunk string) *types.Request {
 	req := types.GetRequest(nil)
 	req.Id = types.Id{ChunkId: chunk}
-	req.Cleanup = counter.Load()
+	req.RequestGroup = counter.Load()
 	counter.Requests[req.Id.Chunk()] = req
 	return req
 }
@@ -44,17 +44,17 @@ var _ = Describe("RequestCoordinator", func() {
 
 	It("should single chunk request be recycled", func() {
 		counter := &TestRequestCounter{}
-		counter.reset(coordinator, "test", "get", 1, 0)
+		counter.reset(coordinator, "test", "get", 1, 0, nil)
 		req := newRequest(counter, "0")
-		err := req.SetResponse(errDummyResponse)
+		err := req.SetErrorResponse(errDummyResponse)
 
-		Expect(err).To(Equal(types.ErrNoClient))
+		Expect(err).To(BeNil())
 		Expect(counter.recycled).To(Equal(int32(1)))
 	})
 
 	It("should timeout in request lock free", func() {
 		counter := &TestRequestCounter{}
-		counter.reset(coordinator, "test", "get", 1, 0)
+		counter.reset(coordinator, "test", "get", 1, 0, nil)
 		req := newRequest(counter, "0")
 
 		go func() {
@@ -64,7 +64,7 @@ var _ = Describe("RequestCoordinator", func() {
 		}()
 		runtime.Gosched()
 
-		req.SetResponse(errDummyResponse)
+		req.SetErrorResponse(errDummyResponse)
 
 		<-time.After(100 * time.Millisecond)
 		Expect(counter.recycled).To(Equal(int32(1)))

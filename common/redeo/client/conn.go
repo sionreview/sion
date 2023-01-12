@@ -9,11 +9,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/mason-leap-lab/redeo/client"
 	"github.com/mason-leap-lab/redeo/resp"
-	"github.com/sionreview/sion/common/net"
+	"github.com/sionreview/sion/common/util"
 )
 
 // Define different Errors during the connection
@@ -37,7 +36,6 @@ type Conn struct {
 	Meta    interface{}
 	Handler ResponseHandler
 
-	shortcut  *net.MockConn
 	lastError error
 	cwnd      *Window
 	rseq      chan interface{}
@@ -46,12 +44,6 @@ type Conn struct {
 	routings  sync.WaitGroup
 	wMu       sync.Mutex   // Mutex to avoid concurrent writing to the connection.
 	wReq      *RequestMeta // Request that is writing to the connection now.
-}
-
-func NewShortcut(cn *net.MockConn, configs ...ConnConfig) *Conn {
-	conn := NewConn(cn.Client, configs...)
-	conn.shortcut = cn
-	return conn
 }
 
 func NewConn(cn sysnet.Conn, configs ...ConnConfig) *Conn {
@@ -71,51 +63,50 @@ func NewConn(cn sysnet.Conn, configs ...ConnConfig) *Conn {
 }
 
 // StartRequest increase the request counter by 1
-func (conn *Conn) StartRequest(req Request, writes ...RequestWriter) error {
+func (conn *Conn) StartRequest(req Request, writes ...RequestWriter) (err error) {
 	// Abort if the request has responded
-	if req.IsResponded() {
-		return nil
+	if reason, ok := req.IsResponded(); ok {
+		return fmt.Errorf("%v: %s", ErrResponded, reason)
 	}
-
-	// Add request to the cwnd
 	req.SetContext(context.WithValue(req.Context(), CtxKeyConn, conn))
-	meta, err := conn.cwnd.AddRequest(req)
-	if err != nil {
+
+	// Lock writer
+	if err := conn.writeStart(req); err != nil { // If connection is closed, err will be returned.
 		return err
 	}
 
-	// Lock writer
-	conn.writeStart(meta)
-	defer conn.writeEnd()
-
 	if conn.IsClosed() {
-		return ErrConnectionClosed
+		// Request will be cleared.
+		return conn.writeEnd(req, ErrConnectionClosed)
 	}
 
 	// Both calback writer and request writer (Flush) are supported.
+	conn.SetWriteDeadline(time.Now().Add(DefaultTimeout))
 	for _, write := range writes {
-		err := write(req)
-		if err != nil && conn.isConnectionFailed(err) {
-			conn.Close()
-		}
+		err = write(req) // Keep track of the last error
 		if err != nil {
-			return err
+			break
 		}
 	}
-	err = req.Flush()
-	if err != nil && conn.isConnectionFailed(err) {
-		conn.Close()
-	}
-	if err != nil {
-		return err
+	// Flush if no error
+	if err == nil {
+		err = req.Flush()
 	}
 
-	// If request get responded during adding, EndRequest may or may not be called successfully.
-	// Ack again to ensure req getting removed from cwnd.
-	if req.IsResponded() {
+	// Handle result
+	if err != nil {
+		// Handle connection error
+		if conn.isConnectionFailed(err) {
+			conn.Close()
+		}
+	} else if _, ok := req.IsResponded(); ok {
+		// If request get responded during adding, EndRequest may or may not be called successfully.
+		// Ack again to ensure req getting removed from cwnd.
 		conn.cwnd.AckRequest(req.Seq())
 	}
-	return nil
+
+	// End request
+	return conn.writeEnd(req, err)
 }
 
 // StartRequest increase the request counter by 1
@@ -128,44 +119,55 @@ func (conn *Conn) LastError() error {
 }
 
 func (conn *Conn) IsClosed() bool {
-	return atomic.LoadUint32(&conn.closed) == 1
+	if atomic.LoadUint32(&conn.closed) == 1 {
+		// Wait for the connection to be closed.
+		<-conn.done
+		return true
+	} else {
+		return false
+	}
+}
+
+func (conn *Conn) Close() error {
+	return conn.CloseWithReason("closed")
 }
 
 // Close Signal connection should be closed. Function close() will be called later for actural operation
-func (conn *Conn) Close() error {
+func (conn *Conn) CloseWithReason(reason string) error {
 	if !atomic.CompareAndSwapUint32(&conn.closed, 0, 1) {
 		return ErrConnectionClosed
 	}
 
+	// Close connection to force block read to quit
+	err := util.CloseWithReason(conn.GetConn(), reason)
+
 	// Signal sub-goroutings to quit.
 	select {
 	case <-conn.done:
+		return ErrConnectionClosed
 	default:
 		close(conn.done)
 	}
-
-	// Close connection to force block read to quit
-	err := conn.GetConn().Close()
-	conn.invalidate(conn.shortcut)
 
 	go func() {
 		// Wait for quiting of all sub-goroutings
 		conn.routings.Wait()
 
 		// Release resources
-		conn.Release()
+		conn.Conn.Close()
 	}()
 
 	return err
 }
 
-// SetDeadline overwrites default implementation by reset the timeout of writing request.
+// SetDeadline overwrites default implementation by reset the timeout of both reading and writing request.
 func (conn *Conn) SetDeadline(t time.Time) error {
 	err := conn.Conn.SetDeadline(t)
 	if err != nil {
 		return err
 	}
 
+	// Set deadline of wReq is mainly for reading response.
 	wReq := conn.wReq
 	if wReq != nil {
 		wReq.Deadline = t
@@ -173,9 +175,9 @@ func (conn *Conn) SetDeadline(t time.Time) error {
 	return nil
 }
 
-// SetWriteDeadline overwrites default implementation by reset the timeout of writing request.
-func (conn *Conn) SetWriteDeadline(t time.Time) error {
-	err := conn.Conn.SetWriteDeadline(t)
+// SetReadDeadline overwrites default implementation by reset the timeout of reading request.
+func (conn *Conn) SetReadDeadline(t time.Time) error {
+	err := conn.Conn.SetReadDeadline(t)
 	if err != nil {
 		return err
 	}
@@ -191,17 +193,29 @@ func (conn *Conn) SetWindowSize(size int) {
 	conn.cwnd.SetSize(size)
 }
 
-func (conn *Conn) writeStart(req *RequestMeta) {
+func (conn *Conn) writeStart(req Request) (err error) {
 	conn.wMu.Lock()
-	conn.wReq = req
+	meta, err := conn.cwnd.AddRequest(req) // If connection is closed, err will be returned.
+	if err != nil {
+		conn.wMu.Unlock()
+		return err
+	}
+	conn.wReq = meta
 	conn.routings.Add(1) // Avoid connection being release during writing.
+	return
 }
 
-func (conn *Conn) writeEnd() {
+func (conn *Conn) writeEnd(req Request, err error) error {
 	conn.routings.Done()
-	conn.wReq.Deadline = time.Now().Add(DefaultTimeout)
+	if err == nil {
+		conn.wReq.Sent = true
+		conn.wReq.Deadline = time.Now().Add(DefaultTimeout)
+	} else {
+		conn.cwnd.AckRequest(req.Seq())
+	}
 	conn.wReq = nil
 	conn.wMu.Unlock()
+	return err
 }
 
 func (conn *Conn) handleResponses() {
@@ -209,15 +223,12 @@ func (conn *Conn) handleResponses() {
 	defer conn.routings.Done()
 
 	for {
-		// Got response, reset read deadline.
-		conn.SetReadDeadline(time.Time{})
-
 		// Peek Response
 		go conn.readSeq()
 		var read interface{}
 		select {
 		case <-conn.done:
-			conn.close()
+			conn.close("closed")
 			return
 		case read = <-conn.rseq:
 		}
@@ -227,7 +238,7 @@ func (conn *Conn) handleResponses() {
 		switch ret := read.(type) {
 		case error:
 			conn.lastError = ret
-			conn.close()
+			conn.close("closedError")
 			return
 		case int64:
 			rseq = ret
@@ -242,27 +253,34 @@ func (conn *Conn) handleResponses() {
 			readErr = err
 		} else if conn.Handler == nil {
 			readErr = ErrNoHandler
-			req.SetResponse(readErr)
+			req.SetResponse(readErr, "handling responses")
 		} else {
 			err = conn.Handler.ReadResponse(req)
 			if err != nil && conn.isConnectionFailed(err) {
 				readErr = err
 			}
 			// Set ErrNoResponse as default response
-			req.SetResponse(ErrNoResponse)
+			req.SetResponse(ErrNoResponse, "handling responses")
 		}
 
 		if readErr != nil {
 			conn.lastError = readErr
-			conn.close()
+			conn.close("closedError")
 			return
 		}
 	}
 }
 
 func (conn *Conn) readSeq() {
+	if conn.IsClosed() {
+		return
+	}
+
 	conn.routings.Add(1)
 	defer conn.routings.Done()
+
+	// Got response, reset read deadline.
+	conn.SetReadDeadline(time.Time{})
 
 	ret, err := conn.PeekType()
 	// ret, err := conn.ReadInt()
@@ -295,9 +313,9 @@ func (conn *Conn) notifyRseq(rseq interface{}) {
 	}
 }
 
-func (conn *Conn) close() error {
+func (conn *Conn) close(reason string) error {
 	// Call signal function to avoid duplicated close.
-	err := conn.Close()
+	err := conn.CloseWithReason(reason)
 
 	// Drain possible stucks
 	select {
@@ -311,17 +329,11 @@ func (conn *Conn) close() error {
 	return err
 }
 
-func (conn *Conn) invalidate(shortcut *net.MockConn) {
-	// Thread safe implementation
-	if shortcut != nil && atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&conn.shortcut)), unsafe.Pointer(shortcut), unsafe.Pointer(nil)) {
-		shortcut.Invalid()
-	}
-}
-
 func (conn *Conn) isConnectionFailed(err error) bool {
 	if err == io.EOF || err == io.ErrUnexpectedEOF || err == io.ErrClosedPipe {
 		return true
-	} else if netErr, ok := err.(sysnet.Error); ok && (netErr.Timeout() || !netErr.Temporary()) {
+	} else if _, ok := err.(sysnet.Error); ok {
+		// All net.Error counts, they are either timeout or permanent(non-temporary) error.
 		return true
 	}
 

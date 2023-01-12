@@ -2,7 +2,7 @@
 
 You can refer to this article about how to install Golang on [Ubuntu AMI](https://tecadmin.net/install-go-on-ubuntu/) and [Amazon AMI](https://hackernoon.com/deploying-a-go-application-on-aws-ec2-76390c09c2c5).
 
-Also, in current release, we recommend to use **Golang 1.16** and **Ubuntu AMI** on AWS.
+Also, in current release, we recommend to use **Golang 1.18** and **Ubuntu AMI** on AWS.
 
 ```bash
 sudo apt-get update
@@ -12,8 +12,8 @@ sudo apt-get -y upgrade
 Download the Go language binary archive.
 
 ```bash
-wget https://dl.google.com/go/go1.16.linux-amd64.tar.gz
-sudo tar -xvf go1.16.linux-amd64.tar.gz
+wget https://dl.google.com/go/go1.18.linux-amd64.tar.gz
+sudo tar -xvf go1.18.linux-amd64.tar.gz
 sudo mv go /usr/local
 ```
 
@@ -30,7 +30,7 @@ Verify installation
 
 ```bash
 ~$ go version
-~$ go version go1.16 linux/amd64
+~$ go version go1.18 linux/amd64
 
 ~$ go env
 ...

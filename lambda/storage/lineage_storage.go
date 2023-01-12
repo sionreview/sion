@@ -3,7 +3,6 @@ package storage
 import (
 	"bytes"
 	"compress/gzip"
-	"container/heap"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -20,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/kelindar/binary"
 	csync "github.com/sionreview/sion/common/sync"
+	"github.com/sionreview/sion/common/sync/heap"
 	"github.com/zhangjyr/hashmap"
 
 	mys3 "github.com/sionreview/sion/common/aws/s3"
@@ -144,14 +144,16 @@ func (s *LineageStorage) setWithOption(key string, chunk *types.Chunk, opt *type
 	}
 
 	s.setSafe.Wait()
-	// Commented by sion: No lock required any more, chunk.Term is assigned initially, and decided after persisted.
+	// Commented by Tianium: No lock required any more, chunk.Term is assigned initially, and decided after persisted.
 	// // Lock lineage, ensure operation get processed in the term.
 	// s.lineageMu.Lock()
 	// defer s.lineageMu.Unlock()
 	// s.log.Debug("in mutex of setting key %v", key)
 
 	// Oversize check.
-	if updatedOpt, ok := s.helper.validate(chunk, opt); ok {
+	if opt != nil && opt.Sized {
+		// pass
+	} else if updatedOpt, ok := s.helper.validate(chunk, opt); ok {
 		opt = updatedOpt
 	} else {
 		return types.OpError(ErrOOStorage)
@@ -174,21 +176,26 @@ func (s *LineageStorage) validate(test *types.Chunk, opt *types.OpWrapper) (*typ
 		s.bufferAdd(test)
 	}
 
-	size := s.meta.IncreaseSize(test.Size)                      // Oversize test.
+	size := s.meta.IncreaseSize(test.Size) // Oversize test.
+	fit := true
 	for size >= s.meta.Effective() && s.bufferMeta.Size() > 0 { // No need to init buffer if test is not to be buffered, bufferMeta.Size() would be 0 in this case.
 		evicted := heap.Pop(s.bufferQueue).(*types.Chunk)
 		s.bufferMeta.DecreaseSize(evicted.Size)
 		// If validate is called iteratively, make sure iterate test chunks using reversed heap.
 		// RU of to be delegated is before LRU of delegated already. Stop.
 		if evicted == test {
+			fit = false
 			break
 		}
 
 		// evicted must be objects previously in buffer.
 		s.PersistentStorage.delWithOption(evicted, "eviction", nil)
+		s.log.Info("%s evicted", evicted.Key)
 		size = s.meta.Size()
 	}
-	if size < s.meta.Effective() {
+	// Modified by Tianium 20221120
+	// Don't load real time size. Use the local variable to be consistent.
+	if fit {
 		if opt == nil {
 			opt = &types.OpWrapper{}
 		}
@@ -210,7 +217,7 @@ func (s *LineageStorage) Del(key string, reason string) *types.OpRet {
 
 	s.setSafe.Wait()
 
-	// Commented by sion: No lock required any more, chunk.Term is assigned initially, and decided after persisted.
+	// Commented by Tianium: No lock required any more, chunk.Term is assigned initially, and decided after persisted.
 	// // Lock lineage
 	// s.lineageMu.Lock()
 	// defer s.lineageMu.Unlock()
@@ -453,9 +460,13 @@ func (s *LineageStorage) StopTracker() error {
 
 // Status returns the status of the storage.
 // If short is specified, returns nil if all terms confirmed, or returns the meta of main storage only.
-func (s *LineageStorage) Status(short bool) types.LineageStatus {
-	if short && s.unconfirmedEnd == s.unconfirmedStart {
-		return nil
+func (s *LineageStorage) Status(short bool) (confirmedTerm uint64, status types.LineageStatus) {
+	confirmedTerm = s.lineage.Term
+	if s.unconfirmedStart < s.unconfirmedEnd {
+		confirmedTerm = s.unconfirmed[s.unconfirmedStart].Term
+	} else if short {
+		// If short and no unconfirmed, we are done.
+		return
 	}
 
 	meta := &protocol.Meta{
@@ -471,9 +482,9 @@ func (s *LineageStorage) Status(short bool) types.LineageStatus {
 		meta.SnapshotSize = s.snapshot.Size
 	}
 	if s.backupLineage != nil && !short {
-		return types.LineageStatus{meta, s.backupLineage.Meta}
+		return confirmedTerm, types.LineageStatus{meta, s.backupLineage.Meta}
 	} else {
-		return types.LineageStatus{meta}
+		return confirmedTerm, types.LineageStatus{meta}
 	}
 }
 
@@ -672,6 +683,7 @@ func (s *LineageStorage) doCommitTerm(lineage *types.LineageTerm, uploader *s3ma
 		copy(s.unconfirmed[:s.unconfirmedEnd-s.unconfirmedStart], s.unconfirmed[s.unconfirmedStart:s.unconfirmedEnd])
 		s.unconfirmedEnd -= s.unconfirmedStart
 		s.unconfirmedStart = 0
+		s.unconfirmed = s.unconfirmed[:s.unconfirmedEnd]
 	}
 	// Append unconfirmed term
 	s.unconfirmed = append(s.unconfirmed, term)
@@ -1140,6 +1152,8 @@ func (s *LineageStorage) doReplayLineage(meta *types.LineageMeta, terms []*types
 		// Remove servingKey from the download list if it is not new and no reset is required.
 		if servingKey != "" && tbds[0].IsAvailable() {
 			tbds = tbds[1:]
+			// Clear serveringKey to prevent it from being removed again.
+			servingKey = ""
 		}
 
 		// Passing by, update local snapshot
@@ -1319,7 +1333,7 @@ func (s *LineageStorage) doRecoverObjects(ctx context.Context, tbds []*types.Chu
 	// Setup inputs for terms downloading.
 	more := true
 	ctxDone := ctx.Done()
-	cancelled := false
+	canceled := false
 	go func() {
 		defer close(inputs)
 
@@ -1329,7 +1343,7 @@ func (s *LineageStorage) doRecoverObjects(ctx context.Context, tbds []*types.Chu
 				select {
 				case <-ctxDone:
 					more = false
-					cancelled = true // Flag terminated, wait for download consumes all scheduled. Then, the interrupted err will be returned.
+					canceled = true // Flag terminated, wait for download consumes all scheduled. Then, the interrupted err will be returned.
 					return
 				default:
 				}
@@ -1342,7 +1356,7 @@ func (s *LineageStorage) doRecoverObjects(ctx context.Context, tbds []*types.Chu
 			}
 
 			bucket := s.bucket(&tbds[i].Bucket)
-			key := aws.String(fmt.Sprintf(CHUNK_KEY, s.s3prefix, tbds[i].Key))
+			key := aws.String(s.getS3Key(tbds[i].Key))
 			tbds[i].Body = make([]byte, tbds[i].Size) // Pre-allocate fixed sized buffer.
 
 			if num, err := downloader.Schedule(inputs, func(input *mys3.BatchDownloadObject) {
@@ -1375,7 +1389,7 @@ func (s *LineageStorage) doRecoverObjects(ctx context.Context, tbds []*types.Chu
 		ctx := aws.BackgroundContext()
 		ctx = context.WithValue(ctx, &ContextKeyLog, s.log)
 		err := downloader.DownloadWithIterator(ctx, inputs)
-		if cancelled {
+		if canceled {
 			chanError <- ErrRecoveryInterrupted
 		} else if err != nil {
 			s.log.Error("error on download objects: %v", err)

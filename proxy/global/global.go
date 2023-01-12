@@ -7,7 +7,8 @@ import (
 
 	"github.com/sionreview/sion/common/logger"
 
-	protocol "github.com/sionreview/sion/common/types"
+	"github.com/mason-leap-lab/go-utils/promise"
+	"github.com/sionreview/sion/proxy/config"
 	"github.com/sionreview/sion/proxy/types"
 )
 
@@ -19,9 +20,10 @@ var (
 	ReqCoordinator   = NewRequestCoordinator(1024)
 	Migrator         types.MigrationScheduler
 	BasePort         = 6378
-	BaseMigratorPort = 6380
+	LambdaServePorts = 1
+	BaseMigratorPort = 6400
 	ServerIp         string
-	Flags            uint64
+	LambdaFlags      uint64
 )
 
 func init() {
@@ -36,23 +38,36 @@ func init() {
 		ServerIp = ip
 	}
 
-	Flags = protocol.FLAG_ENABLE_WARMUP | protocol.FLAG_ENABLE_PERSISTENT | protocol.FLAG_DISABLE_WAIT_FOR_COS
+	LambdaFlags = config.LambdaFeatures
+	promise.InitPool(10000)
 }
 
 func IsWarmupWithFixedInterval() bool {
-	return Flags&protocol.FLAG_FIXED_INTERVAL_WARMUP > 0
+	return config.ProxyFeatures&config.FLAG_FIXED_INTERVAL_WARMUP > 0
+}
+
+func IsClientsideFirstDOptimization() bool {
+	return config.ProxyFeatures&config.FLAG_CLIENTSIDE_FIRSTD_OPTIMIZATION > 0
+}
+
+func IsLocalCacheEnabled() bool {
+	return config.ProxyFeatures&config.FLAG_ENABLE_LOCAL_CACHE > 0
 }
 
 func GetLogger(prefix string) logger.ILogger {
 	return &logger.ColorLogger{
-		Prefix: prefix,
-		Level:  Log.GetLevel(),
-		Color:  !Options.NoColor,
+		Prefix:  prefix,
+		Level:   Log.GetLevel(),
+		Color:   !Options.NoColor,
+		Verbose: Log.GetLevel() == logger.LOG_LEVEL_ALL,
 	}
 }
 
 func SetLoggerLevel(level int) {
 	if color, ok := Log.(*logger.ColorLogger); ok {
 		color.Level = level
+		if level == logger.LOG_LEVEL_ALL {
+			color.Verbose = true
+		}
 	}
 }
